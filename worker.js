@@ -23,9 +23,10 @@ export default {
       const apiKey = (env.GEMINI_API_KEY || "").trim();
       if (!apiKey) return json({ error: { message: "Missing GEMINI_API_KEY in Cloudflare Variables." } }, 500);
 
-      // Tries the newest model first. If it is slow or busy, falls back to the next one.
-      const MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"];
-      const PER_MODEL_MS = 20000;
+      // gemini-2.5-flash is closed to new users, so we only use gemini-3.8-flash.
+      // If it is slow or busy, we try it one more time before giving up.
+      const MODELS = ["gemini-3.8-flash", "gemini-3.8-flash"];
+      const PER_MODEL_MS = 22000;
 
       const generationFor = (model, extra) => {
         const cfg = { ...extra };
@@ -35,6 +36,7 @@ export default {
 
       async function askGemini(prompt, extraConfig) {
         let last = { status: 504, data: { error: { message: "The AI is busy right now. Please try again." } } };
+        let first = null;
         for (const model of MODELS) {
           const ac = new AbortController();
           const timer = setTimeout(() => ac.abort(), PER_MODEL_MS);
@@ -54,14 +56,17 @@ export default {
             const data = await res.json().catch(() => ({}));
             if (res.ok) return { status: 200, data: { ...data, model } };
             last = { status: res.status, data };
-            if (![404, 429, 500, 503].includes(res.status)) break; // real error, do not retry
+            if (!first) first = last;
+            if (![429, 500, 503].includes(res.status)) break; // real error, do not retry
           } catch (err) {
             last = { status: 504, data: { error: { message: `${model} did not answer in time.` } } };
+            if (!first) first = last;
           } finally {
             clearTimeout(timer);
           }
+          await new Promise((r) => setTimeout(r, 800));
         }
-        return last;
+        return first || last; // show the first (real) problem, not the retry
       }
 
       // Mode 1: StudyBuddy chat
