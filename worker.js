@@ -34,7 +34,7 @@ export default {
       // Mode 1: StudyBuddy Online AI Chat (Supports both "web" general knowledge and "notes" search)
       if (body.mode === "chat") {
         const question = (body.question || "").slice(0, 2000);
-        const context = (body.context || "").slice(0, 18000);
+        const context = (body.context || "").slice(0, 30000);
         const source = body.source || "web"; // "web" or "notes"
 
         if (!question) {
