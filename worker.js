@@ -16,11 +16,21 @@ export default {
 
     try {
       const body = await request.json();
+      const apiKey = (env.GEMINI_API_KEY || "").trim();
+      if (!apiKey) {
+        return new Response(JSON.stringify({ error: { message: "Missing GEMINI_API_KEY in Cloudflare Variables." } }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
 
-      // Mode 1: StudyBuddy Chat / Ask AI (20/day)
+      const model = "gemini-3.8-flash";
+      const url = `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+      // Mode 1: Fast StudyBuddy Online AI Chat (20/day)
       if (body.mode === "chat") {
         const question = (body.question || "").slice(0, 2000);
-        const context = (body.context || "").slice(0, 25000);
+        const context = (body.context || "").slice(0, 15000);
         if (!question) {
           return new Response(JSON.stringify({ error: { message: "Please enter a question." } }), {
             status: 400,
@@ -28,20 +38,21 @@ export default {
           });
         }
 
-        const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{
-                parts: [{
-                  text: `You are StudyBuddy, a concise, helpful study tutor. Answer the student's request clearly. Use the provided study notes if relevant, or your own knowledge if not covered in the notes.\n\nStudent's Notes Context:\n${context || "No notes provided."}\n\nStudent's Question:\n${question}`
-                }]
+        const geminiRes = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{
+                text: `You are StudyBuddy, a fast, concise study tutor. Answer clearly in 2 to 5 sentences or short bullet points.\n\nStudy Material Context:\n${context || "None provided."}\n\nQuestion:\n${question}`
               }]
-            })
-          }
-        );
+            }],
+            generationConfig: {
+              maxOutputTokens: 500,
+              temperature: 0.3
+            }
+          })
+        });
 
         const data = await geminiRes.json();
         return new Response(JSON.stringify(data), {
@@ -50,52 +61,32 @@ export default {
         });
       }
 
-      // Mode 2: Flashcards & Multiple Choice Generator (2/day)
-      const text = body.text || "";
-      if (text.length < 50) {
-        return new Response(JSON.stringify({ error: { message: "Text is too short." } }), {
+      // Mode 2: Fast Flashcards & Summary Generator (2/day)
+      const text = (body.text || "").trim();
+      if (text.length < 30) {
+        return new Response(JSON.stringify({ error: { message: "Text is too short to summarize." } }), {
           status: 400,
           headers: { ...corsHeaders, "Content-Type": "application/json" }
         });
       }
 
-      const promptText = text.slice(0, 30000);
-      const geminiRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{
-              parts: [{
-                text: `Summarize the following study material into 4 to 6 key bullet points, and create 8 to 15 multiple-choice flashcards. Each flashcard must have a clear question ("q"), the exact correct answer ("a"), and an array of 4 distinct choices ("choices") that includes the exact string in "a".\n\nStudy Material:\n${promptText}`
-              }]
-            }],
-            generationConfig: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: "OBJECT",
-                properties: {
-                  summary: { type: "ARRAY", items: { type: "STRING" } },
-                  cards: {
-                    type: "ARRAY",
-                    items: {
-                      type: "OBJECT",
-                      properties: {
-                        q: { type: "STRING" },
-                        a: { type: "STRING" },
-                        choices: { type: "ARRAY", items: { type: "STRING" } }
-                      },
-                      required: ["q", "a", "choices"]
-                    }
-                  }
-                },
-                required: ["summary", "cards"]
-              }
-            }
-          })
-        }
-      );
+      const promptText = text.slice(0, 20000);
+      const geminiRes = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: `Summarize the study material into 4 to 6 key bullet points, and create 8 to 12 multiple-choice flashcards. Return ONLY valid JSON matching this exact structure: {"summary":["point 1","point 2"],"cards":[{"q":"question","a":"exact correct answer","choices":["choice 1","choice 2","choice 3","choice 4"]}]}. Make sure "a" is included inside "choices".\n\nStudy Material:\n${promptText}`
+            }]
+          }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            maxOutputTokens: 2048,
+            temperature: 0.3
+          }
+        })
+      });
 
       const data = await geminiRes.json();
       return new Response(JSON.stringify(data), {
