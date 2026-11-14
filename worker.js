@@ -6,27 +6,55 @@ export default {
       "Access-Control-Allow-Headers": "Content-Type",
     };
     const json = (obj, status = 200) =>
-      new Response(JSON.stringify(obj), {
+      new Response(JSON.stringify(obj, null, 2), {
         status,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
 
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-    // Quick health check so the app can tell "server unreachable" from "Gemini slow".
-    if (request.method === "GET") return json({ ok: true });
+    const apiKey = (env.GEMINI_API_KEY || "").trim();
+    const BASE = "https://generativelanguage.googleapis.com/v1beta/";
+
+    // Models this key can use (ids only).
+    async function listModels() {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 8000);
+      try {
+        const res = await fetch(BASE + "models?pageSize=200", {
+          headers: { "x-goog-api-key": apiKey },
+          signal: ac.signal,
+        });
+        const data = await res.json();
+        return (data.models || [])
+          .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+          .map((m) => m.name.replace("models/", ""));
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // GET = health check. GET ?models = shows which models your key can use.
+    if (request.method === "GET") {
+      const url = new URL(request.url);
+      if (url.searchParams.has("models")) {
+        if (!apiKey) return json({ error: "Missing GEMINI_API_KEY" }, 500);
+        try {
+          return json({ models: await listModels() });
+        } catch (e) {
+          return json({ error: "Could not list models: " + e.message }, 504);
+        }
+      }
+      return json({ ok: true, hasKey: !!apiKey });
+    }
 
     if (request.method !== "POST") return json({ error: { message: "Method not allowed" } }, 405);
 
     try {
       const body = await request.json();
-      const apiKey = (env.GEMINI_API_KEY || "").trim();
       if (!apiKey) return json({ error: { message: "Missing GEMINI_API_KEY in Cloudflare Variables." } }, 500);
 
-      // gemini-2.5-flash is closed to new users, so we only use gemini-3.8-flash.
-      // If it is slow or busy, we try it one more time before giving up.
-      const MODELS = ["gemini-3.8-flash", "gemini-3.8-flash"];
-      const PER_MODEL_MS = 22000;
+      const PREFERRED = "gemini-3.8-flash";
 
       const generationFor = (model, extra) => {
         const cfg = { ...extra };
@@ -34,39 +62,59 @@ export default {
         return cfg;
       };
 
+      // Tries the preferred model. If it hangs or fails, discovers other Flash models
+      // this key can use and tries those, so one slow model never blocks the app.
       async function askGemini(prompt, extraConfig) {
-        let last = { status: 504, data: { error: { message: "The AI is busy right now. Please try again." } } };
-        let first = null;
-        for (const model of MODELS) {
+        const problems = [];
+        const tried = new Set();
+        let queue = [PREFERRED];
+        let discovered = false;
+
+        while (queue.length && tried.size < 3) {
+          const model = queue.shift();
+          if (tried.has(model)) continue;
+          tried.add(model);
           const ac = new AbortController();
-          const timer = setTimeout(() => ac.abort(), PER_MODEL_MS);
+          const timer = setTimeout(() => ac.abort(), tried.size === 1 ? 20000 : 12000);
           try {
-            const res = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-                body: JSON.stringify({
-                  contents: [{ parts: [{ text: prompt }] }],
-                  generationConfig: generationFor(model, extraConfig),
-                }),
-                signal: ac.signal,
-              }
-            );
+            const res = await fetch(`${BASE}models/${model}:generateContent`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: generationFor(model, extraConfig),
+              }),
+              signal: ac.signal,
+            });
             const data = await res.json().catch(() => ({}));
             if (res.ok) return { status: 200, data: { ...data, model } };
-            last = { status: res.status, data };
-            if (!first) first = last;
-            if (![429, 500, 503].includes(res.status)) break; // real error, do not retry
+            const msg = (data.error && data.error.message) || "status " + res.status;
+            problems.push(`${model}: ${msg}`.slice(0, 160));
+            if ([400, 401, 403].includes(res.status)) break; // key or request problem
           } catch (err) {
-            last = { status: 504, data: { error: { message: `${model} did not answer in time.` } } };
-            if (!first) first = last;
+            problems.push(`${model}: no answer in time`);
           } finally {
             clearTimeout(timer);
           }
-          await new Promise((r) => setTimeout(r, 800));
+
+          if (!discovered) {
+            discovered = true;
+            try {
+              const ids = await listModels();
+              const others = ids
+                .filter((id) => /^gemini-[\d.]+-flash(-lite)?$/.test(id) && !tried.has(id))
+                .sort(
+                  (a, b) =>
+                    parseFloat(b.match(/[\d.]+/)[0]) - parseFloat(a.match(/[\d.]+/)[0]) ||
+                    b.includes("lite") - a.includes("lite")
+                );
+              queue = queue.concat(others);
+            } catch (e) {
+              problems.push("could not list models");
+            }
+          }
         }
-        return first || last; // show the first (real) problem, not the retry
+        return { status: 504, data: { error: { message: problems.join(" | ") || "The AI is busy. Try again." } } };
       }
 
       // Mode 1: StudyBuddy chat
