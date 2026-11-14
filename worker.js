@@ -24,20 +24,12 @@ export default {
         });
       }
 
-      const model = "gemini-3.8-flash";
-      const url = `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const model = "gemini-2.5-flash";
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-      // Mode 1: Fast StudyBuddy Online AI Chat (20/day)
       if (body.mode === "chat") {
         const question = (body.question || "").slice(0, 2000);
         const context = (body.context || "").slice(0, 15000);
-        if (!question) {
-          return new Response(JSON.stringify({ error: { message: "Please enter a question." } }), {
-            status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" }
-          });
-        }
-
         const geminiRes = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -48,12 +40,12 @@ export default {
               }]
             }],
             generationConfig: {
+              thinkingConfig: { thinkingBudget: 0 },
               maxOutputTokens: 500,
               temperature: 0.3
             }
           })
         });
-
         const data = await geminiRes.json();
         return new Response(JSON.stringify(data), {
           status: geminiRes.status,
@@ -61,15 +53,7 @@ export default {
         });
       }
 
-      // Mode 2: Fast Flashcards & Summary Generator (2/day)
       const text = (body.text || "").trim();
-      if (text.length < 30) {
-        return new Response(JSON.stringify({ error: { message: "Text is too short to summarize." } }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-
       const promptText = text.slice(0, 20000);
       const geminiRes = await fetch(url, {
         method: "POST",
@@ -81,6 +65,7 @@ export default {
             }]
           }],
           generationConfig: {
+            thinkingConfig: { thinkingBudget: 0 },
             responseMimeType: "application/json",
             maxOutputTokens: 2048,
             temperature: 0.3
