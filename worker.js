@@ -5,7 +5,7 @@
 //     GEMINI_API_KEY    = key 1  (StudyBuddy chat + Life Buddy chat)
 //     GEMINI_API_KEY_2  = key 2  (summaries + flashcards only)
 //     ALLOWED_ORIGIN    = https://your-app-address   (comma-separate several if needed)
-//     GEMINI_MODEL      = optional, a model id from  YOUR_WORKER_URL?models
+//     GEMINI_MODEL      = optional override. Default is gemini-3.8-flash. Ids: YOUR_WORKER_URL?models
 //   KV namespace binding:
 //     QUOTA             = a KV namespace (enables the server-side daily limits)
 
@@ -67,7 +67,18 @@ export default {
     const key1 = (env.GEMINI_API_KEY || "").trim();
     const key2 = (env.GEMINI_API_KEY_2 || "").trim() || key1; // falls back to key 1 if key 2 is missing
     const BASE = "https://generativelanguage.googleapis.com/v1beta/";
-    const PREFERRED = (env.GEMINI_MODEL || "").trim() || "gemini-2.5-flash";
+    const PREFERRED = (env.GEMINI_MODEL || "").trim() || "gemini-3.8-flash";
+
+    // Compares versions like 3.8 vs 3.10 correctly (parseFloat would get this wrong).
+    const verCmp = (a, b) => {
+      const x = a.match(/\d+(\.\d+)*/)[0].split(".").map(Number);
+      const y = b.match(/\d+(\.\d+)*/)[0].split(".").map(Number);
+      for (let i = 0; i < Math.max(x.length, y.length); i++) {
+        const d = (x[i] || 0) - (y[i] || 0);
+        if (d) return d;
+      }
+      return 0;
+    };
 
     // Models a key can use (ids only).
     async function listModels(apiKey) {
@@ -136,8 +147,17 @@ export default {
 
       const generationFor = (model, extra) => {
         const cfg = { ...extra };
-        if (model.startsWith("gemini-3")) cfg.thinkingConfig = { thinkingLevel: "low" };
-        else if (/^gemini-2\.5-flash/.test(model)) cfg.thinkingConfig = { thinkingBudget: 0 };
+        const major = parseInt((model.match(/^gemini-(\d+)/) || [])[1] || "0", 10);
+        if (major >= 3) {
+          // Gemini 3+: temperature/topP/topK are deprecated, so they are removed.
+          // "low" keeps replies fast ("minimal" is not supported on 3.8 Flash).
+          delete cfg.temperature;
+          delete cfg.topP;
+          delete cfg.topK;
+          cfg.thinkingConfig = { thinkingLevel: "low" };
+        } else if (/^gemini-2\.5-flash/.test(model)) {
+          cfg.thinkingConfig = { thinkingBudget: 0 }; // older fallback models only
+        }
         return cfg;
       };
 
@@ -183,7 +203,7 @@ export default {
                 .filter((id) => /^gemini-[\d.]+-flash(-lite)?$/.test(id) && !tried.has(id))
                 .sort(
                   (a, b) =>
-                    parseFloat(b.match(/[\d.]+/)[0]) - parseFloat(a.match(/[\d.]+/)[0]) ||
+                    verCmp(b, a) ||
                     b.includes("lite") - a.includes("lite")
                 );
               queue = queue.concat(others);
@@ -229,7 +249,7 @@ export default {
         if (lastT && lastT.role === "user") lastT.parts[0].text += "\n" + question;
         else turns.push({ role: "user", parts: [{ text: question }] });
 
-        const out = await askGemini(turns, { maxOutputTokens: 400, temperature: 0.7 }, LIFE_SYSTEM);
+        const out = await askGemini(turns, { maxOutputTokens: 1000, temperature: 0.7 }, LIFE_SYSTEM);
         return finish(out, q);
       }
 
@@ -248,7 +268,7 @@ export default {
             ? `You are StudyBuddy. Answer the student's question based PRIMARILY on their study notes below. If the answer is not in the notes, say so briefly and then provide the general answer.\n\nStudent's Study Notes:\n${context || "No notes provided."}\n\nQuestion:\n${question}`
             : `You are StudyBuddy, a smart, fast academic tutor. Answer the student's question clearly and concisely using accurate general knowledge (and their notes if relevant).\n\nOptional Notes Context:\n${context || "None"}\n\nQuestion:\n${question}`;
 
-        const out = await askGemini([{ role: "user", parts: [{ text: prompt }] }], { maxOutputTokens: 800 });
+        const out = await askGemini([{ role: "user", parts: [{ text: prompt }] }], { maxOutputTokens: 2000 });
         return finish(out, q);
       }
 
@@ -271,7 +291,7 @@ export default {
             ],
           },
         ],
-        { responseMimeType: "application/json", maxOutputTokens: 2500 }
+        { responseMimeType: "application/json", maxOutputTokens: 6000 }
       );
       return finish(out, q);
     } catch (err) {
