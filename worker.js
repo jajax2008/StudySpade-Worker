@@ -228,63 +228,107 @@ export default {
         return cfg;
       };
 
-      // Tries the preferred model. If it hangs or fails, discovers other Flash models this key
-      // can use and tries those. A total deadline keeps it under the app's own waiting time.
+      // Asks Gemini. Starts with the preferred model. If it has not answered after a short wait,
+      // a second model is started in parallel (and a third if needed). The first good answer wins
+      // and the rest are cancelled. Always answers before the deadline, so the app never times out first.
       async function askGemini(contents, extraConfig, systemText, opts = {}) {
-        const problems = [];
-        const tried = new Set();
-        const start = Date.now();
         const deadline = opts.deadlineMs || 46000;
-        let queue = [PREFERRED];
-        let discovered = false;
+        const hedgeMs = opts.hedgeMs || 14000;
+        const problems = [];
+        const controllers = [];
 
-        while (queue.length && tried.size < 3) {
-          const model = queue.shift();
-          if (tried.has(model)) continue;
-          tried.add(model);
-          const remaining = deadline - (Date.now() - start);
-          if (remaining < 6000) { problems.push("ran out of time"); break; }
+        const callModel = async (model, think) => {
           const ac = new AbortController();
-          const timer = setTimeout(() => ac.abort(), Math.min(tried.size === 1 ? opts.firstMs || 40000 : 22000, remaining));
+          controllers.push(ac);
+          const payload = { contents, generationConfig: generationFor(model, extraConfig, think) };
+          if (systemText) payload.systemInstruction = { parts: [{ text: systemText }] };
+          const res = await fetch(`${BASE}models/${model}:generateContent`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+            body: JSON.stringify(payload),
+            signal: ac.signal,
+          });
+          const data = await res.json().catch(() => ({}));
+          return { res, data };
+        };
+
+        const attempt = async (model) => {
           try {
-            const payload = { contents, generationConfig: generationFor(model, extraConfig, opts.think) };
-            if (systemText) payload.systemInstruction = { parts: [{ text: systemText }] };
-            const res = await fetch(`${BASE}models/${model}:generateContent`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-              body: JSON.stringify(payload),
-              signal: ac.signal,
-            });
-            const data = await res.json().catch(() => ({}));
-            if (res.ok) return { status: 200, data: { ...data, model } };
-            const msg = (data.error && data.error.message) || "status " + res.status;
+            let think = opts.think;
+            let { res, data } = await callModel(model, think);
+            let msg = (data.error && data.error.message) || "status " + res.status;
+            if (!res.ok && res.status === 400 && think && /think/i.test(msg)) {
+              ({ res, data } = await callModel(model, null));
+              msg = (data.error && data.error.message) || "status " + res.status;
+            }
+            if (res.ok) return { ok: true, status: 200, data: { ...data, model } };
             problems.push(`${model}: ${msg}`.slice(0, 160));
-            if (res.status === 400 && opts.think && /think/i.test(msg)) { opts = { ...opts, think: null }; tried.delete(model); queue.unshift(model); continue; }
-            if ([400, 401, 403].includes(res.status)) break; // key or request problem
+            return { ok: false, status: res.status };
           } catch (err) {
             problems.push(`${model}: no answer in time`);
-          } finally {
-            clearTimeout(timer);
+            return { ok: false, status: 0 };
           }
+        };
 
-          if (!discovered) {
-            discovered = true;
-            try {
-              const ids = await listModels(apiKey);
-              const others = ids
-                .filter((id) => /^gemini-[\d.]+-flash(-lite)?$/.test(id) && !tried.has(id))
-                .sort(
-                  (a, b) =>
-                    verCmp(b, a) ||
-                    b.includes("lite") - a.includes("lite")
-                );
-              queue = queue.concat(others);
-            } catch (e) {
-              problems.push("could not list models");
+        return await new Promise((resolve) => {
+          const tried = new Set();
+          let queue = [PREFERRED];
+          let discovered = false;
+          let active = 0;
+          let done = false;
+          let hedgeTimer = null;
+          let overall = null;
+
+          const stopAll = () => {
+            clearTimeout(hedgeTimer);
+            clearTimeout(overall);
+            controllers.forEach((c) => { try { c.abort(); } catch (e) {} });
+          };
+          const fail = () => {
+            if (done) return;
+            done = true;
+            stopAll();
+            resolve({ status: 504, data: { error: { message: problems.join(" | ") || "The AI is busy. Try again." } } });
+          };
+          const win = (r) => {
+            if (done) return;
+            done = true;
+            stopAll();
+            resolve(r);
+          };
+          overall = setTimeout(() => { problems.push("no answer from " + [...tried].join(", ") + " in time"); fail(); }, deadline);
+
+          const next = async () => {
+            if (done) return;
+            if (!queue.length && !discovered) {
+              discovered = true;
+              try {
+                const ids = await listModels(apiKey);
+                const others = ids
+                  .filter((id) => /^gemini-[\d.]+-flash(-lite)?$/.test(id) && !tried.has(id))
+                  .sort((a, b) => verCmp(b, a) || b.includes("lite") - a.includes("lite"));
+                queue = queue.concat(others);
+              } catch (e) {
+                problems.push("could not list models");
+              }
             }
-          }
-        }
-        return { status: 504, data: { error: { message: problems.join(" | ") || "The AI is busy. Try again." } } };
+            if (done) return;
+            const model = queue.shift();
+            if (!model || tried.size >= 3) { if (active === 0) fail(); return; }
+            if (tried.has(model)) return next();
+            tried.add(model);
+            active++;
+            attempt(model).then((r) => {
+              active--;
+              if (r.ok) return win(r);
+              if ([400, 401, 403].includes(r.status)) { if (active === 0) fail(); return; }
+              next();
+            });
+            clearTimeout(hedgeTimer);
+            hedgeTimer = setTimeout(() => { if (!done) next(); }, hedgeMs);
+          };
+          next();
+        });
       }
 
       const finish = async (out, q) => {
