@@ -12,7 +12,7 @@
 //     QUOTA             = a KV namespace (enables the server-side daily limits)
 
 const TZ_OFFSET_H = 8; // Philippines (UTC+8): daily limits reset at local midnight
-const LIMITS = { chat: 30, life: 40, cards: 2, acct: 80 }; // per device per day
+const LIMITS = { chat: 30, life: 40, cards: 2, acct: 80, cardgen: 8 }; // per device per day
 const IP_FACTOR = 6; // per-IP cap = limit x 6 (phone networks often share one IP)
 
 // Backstop only: the app checks for crisis wording first, this catches anything that slips through.
@@ -424,6 +424,41 @@ export default {
       // Mode: flashcards and summary (key 1)
       const text = (body.text || "").toString().trim();
       if (text.length < 30) return json({ error: { message: "Text is too short to summarize." } }, 400);
+
+      const stage = body.stage === "summary" || body.stage === "cards" ? body.stage : "";
+      if (stage) {
+        const pt = text.slice(0, 22000);
+        if (stage === "summary") {
+          const q1 = await checkQuota("cards", device);
+          if (!q1.ok) return limitReply();
+          const o1 = await askGemini(
+            [{ role: "user", parts: [{ text: `Summarize the following study material into 5 to 8 clear key bullet points. Return ONLY valid JSON: {"summary":["point 1","point 2"]}.\n\nStudy Material:\n${pt}` }] }],
+            { responseMimeType: "application/json", maxOutputTokens: 3000 },
+            undefined,
+            { deadlineMs: 60000 }
+          );
+          return finish(o1, q1);
+        }
+        const count = Math.max(5, Math.min(120, parseInt(body.count, 10) || 10));
+        const g = await checkQuota("cardgen", device);
+        if (!g.ok) return limitReply();
+        let q2 = null;
+        if (body.big) {
+          q2 = await checkQuota("cards", device);
+          if (!q2.ok) return limitReply();
+        }
+        const o2 = await askGemini(
+          [{ role: "user", parts: [{ text: `Create exactly ${count} multiple-choice flashcards from the study material below. Cover the whole material evenly with no duplicates. Each card has one question, the exact correct answer, and 4 choices that include the correct answer (the wrong choices must be plausible). Return ONLY valid JSON: {"cards":[{"q":"question","a":"exact correct answer","choices":["choice 1","choice 2","choice 3","choice 4"]}]}.\n\nStudy Material:\n${pt}` }] }],
+          { responseMimeType: "application/json", maxOutputTokens: Math.min(30000, count * 170 + 800) },
+          undefined,
+          { deadlineMs: 110000, hedgeMs: 45000 }
+        );
+        if (o2.status === 200) {
+          if (g.commit) await g.commit();
+          if (q2 && q2.commit) await q2.commit();
+        }
+        return json(o2.data, o2.status);
+      }
 
       const q = await checkQuota("cards", device);
       if (!q.ok) return limitReply();
