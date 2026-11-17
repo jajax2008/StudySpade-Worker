@@ -12,7 +12,7 @@
 //     QUOTA             = a KV namespace (enables the server-side daily limits)
 
 const TZ_OFFSET_H = 8; // Philippines (UTC+8): daily limits reset at local midnight
-const LIMITS = { chat: 30, life: 40, cards: 2, acct: 80, cardgen: 8 }; // per device per day
+const LIMITS = { chat: 30, life: 40, cards: 2, acct: 80, cardgen: 8, assign: 30 }; // per device per day
 const IP_FACTOR = 6; // per-IP cap = limit x 6 (phone networks often share one IP)
 
 // Backstop only: the app checks for crisis wording first, this catches anything that slips through.
@@ -207,9 +207,9 @@ export default {
       if (!body || typeof body !== "object") return json({ error: { message: "Bad request." } }, 400);
 
       const device = /^[a-z0-9]{8,40}$/i.test(body.device || "") ? body.device : "";
-      const mode = body.mode === "acct" ? "accounting" : ["chat", "life", "accounting"].includes(body.mode) ? body.mode : "cards";
-      const kind = mode === "chat" ? "chat" : mode === "life" ? "life" : mode === "accounting" ? "acct" : "cards";
-      const apiKey = mode === "life" ? key2 : mode === "accounting" ? key3 : key1; // chat + cards use key 1
+      const mode = body.mode === "acct" ? "accounting" : ["chat", "life", "accounting", "assign"].includes(body.mode) ? body.mode : "cards";
+      const kind = mode === "chat" ? "chat" : mode === "life" ? "life" : mode === "accounting" ? "acct" : mode === "assign" ? "assign" : "cards";
+      const apiKey = mode === "life" || mode === "assign" ? key2 : mode === "accounting" ? key3 : key1; // chat + cards use key 1
       if (!apiKey) return json({ error: { message: mode === "accounting" ? "The Accounting Companion key (GEMINI_API_KEY_3) is not set up on the server." : "The AI key is not set up on the server." } }, 500);
 
       const generationFor = (model, extra, think) => {
@@ -402,6 +402,34 @@ export default {
         return finish(guardAcct(out), q);
       }
 
+      // Mode: assignment helper (key 2, shared with Life Buddy)
+      if (mode === "assign") {
+        const ASSIGN_SYSTEM = `You are a patient, friendly homework helper inside a student's study app. If images are attached, read them carefully (handwriting, printed questions, diagrams) and say briefly what you see. Explain step by step so the student understands the method, not just the result. Worked solutions are fine when you explain each step. Keep answers focused: short paragraphs or a numbered list, no more than about 10 lines. If the question is unclear or the image is blurry, ask one specific question. Reply in the language the student writes in (English, Tagalog or Taglish). Stay on schoolwork.`;
+        const question = (body.question || "").toString().slice(0, 1500).trim();
+        const imgs = (Array.isArray(body.images) ? body.images : []).slice(0, 3).filter((m) => m && typeof m.data === "string" && m.data.length < 3000000 && /^image\/(jpeg|png|webp)$/.test(m.mime || ""));
+        if (!question && !imgs.length) return json({ error: { message: "Please write a question or add an image." } }, 400);
+        const q = await checkQuota("assign", device);
+        if (!q.ok) return limitReply();
+        const turns = [];
+        const hist = Array.isArray(body.history) ? body.history.slice(-8) : [];
+        for (const h of hist) {
+          const role = h && h.role === "model" ? "model" : h && h.role === "user" ? "user" : null;
+          const text = h && typeof h.text === "string" ? h.text.slice(0, 600) : "";
+          if (!role || !text) continue;
+          const last = turns[turns.length - 1];
+          if (last && last.role === role) last.parts[0].text += "\n" + text;
+          else turns.push({ role, parts: [{ text }] });
+        }
+        while (turns.length && turns[0].role !== "user") turns.shift();
+        const info = `ASSIGNMENT: ${(body.title || "").toString().slice(0, 120)}\nSUBJECT: ${(body.subject || "").toString().slice(0, 60)}\nDUE: ${(body.due || "").toString().slice(0, 20)}\nDETAILS: ${(body.details || "").toString().slice(0, 1500)}`;
+        const parts = [{ text: info + "\n\nSTUDENT:\n" + (question || "Please help me with the attached image.") }, ...imgs.map((m) => ({ inlineData: { mimeType: m.mime, data: m.data } }))];
+        const lastT = turns[turns.length - 1];
+        if (lastT && lastT.role === "user") lastT.parts.push(...parts);
+        else turns.push({ role: "user", parts });
+        const out = await askGemini(turns, { maxOutputTokens: 2000 }, ASSIGN_SYSTEM, { deadlineMs: 60000 });
+        return finish(out, q);
+      }
+
       // Mode: StudyBuddy chat (key 1)
       if (mode === "chat") {
         const question = (body.question || "").toString().slice(0, 2000);
@@ -417,7 +445,8 @@ export default {
             ? `You are StudyBuddy. Answer the student's question based PRIMARILY on their study notes below. If the answer is not in the notes, say so briefly and then provide the general answer.\n\nStudent's Study Notes:\n${context || "No notes provided."}\n\nQuestion:\n${question}`
             : `You are StudyBuddy, a smart, fast academic tutor. Answer the student's question clearly and concisely using accurate general knowledge (and their notes if relevant).\n\nOptional Notes Context:\n${context || "None"}\n\nQuestion:\n${question}`;
 
-        const out = await askGemini([{ role: "user", parts: [{ text: prompt }] }], { maxOutputTokens: 2000 });
+        const cimgs = (Array.isArray(body.images) ? body.images : []).slice(0, 3).filter((m) => m && typeof m.data === "string" && m.data.length < 3000000 && /^image\/(jpeg|png|webp)$/.test(m.mime || ""));
+        const out = await askGemini([{ role: "user", parts: [{ text: prompt }, ...cimgs.map((m) => ({ inlineData: { mimeType: m.mime, data: m.data } }))] }], { maxOutputTokens: 2000 });
         return finish(out, q);
       }
 
