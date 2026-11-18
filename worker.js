@@ -5,9 +5,14 @@
 //     GEMINI_API_KEY    = key 1  (StudyBuddy chat + summaries + flashcards)
 //     GEMINI_API_KEY_2  = key 2  (Life Buddy only)
 //     GEMINI_API_KEY_3  = key 3  (Accounting Companion only, no fallback)
-//     ALLOWED_ORIGIN    = https://your-app-address   (comma-separate several if needed)
+//     GEMINI_API_KEY_4  = key 4  (optional: Assignment Helper. Falls back to key 1, never key 2)
+//     ALLOWED_ORIGIN    = https://jajax2008.github.io   (comma-separate several if needed)
+//                         The Android app origins (https://localhost, http://localhost,
+//                         capacitor://localhost) are always allowed automatically.
+//     ADMIN_TOKEN       = optional secret. Without it the ?ping and ?models test pages are OFF.
+//     ACCT_PASS         = optional secret. If set, the Accounting Companion also needs body.pass to match.
 //     GEMINI_MODEL      = optional override. Default is gemini-3.8-flash. Ids: YOUR_WORKER_URL?models
-//   Tests: YOUR_WORKER_URL?ping&key=1 (or 2, 3) times a tiny question. Add &model=ID to test another model.
+//   Tests (need ADMIN_TOKEN): YOUR_WORKER_URL?ping&key=1&token=SECRET (key 1, 2 or 3) times a tiny question. Add &model=ID to test another model.
 //   KV namespace binding:
 //     QUOTA             = a KV namespace (enables the server-side daily limits)
 
@@ -83,7 +88,10 @@ const guardAcct = (out) => {
 export default {
   async fetch(request, env) {
     const reqOrigin = request.headers.get("Origin");
-    const allowed = (env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const allowedRaw = (env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
+    // The installed Android app (Capacitor) always sends one of these origins.
+    const APP_ORIGINS = ["https://localhost", "http://localhost", "capacitor://localhost"];
+    const allowed = allowedRaw.length ? allowedRaw.concat(APP_ORIGINS) : allowedRaw;
     const originOk = !allowed.length || !reqOrigin || allowed.includes(reqOrigin);
     const corsHeaders = {
       "Access-Control-Allow-Origin": allowed.length ? (allowed.includes(reqOrigin) ? reqOrigin : allowed[0]) : "*",
@@ -103,6 +111,7 @@ export default {
     const key1 = (env.GEMINI_API_KEY || "").trim();
     const key2 = (env.GEMINI_API_KEY_2 || "").trim() || key1; // Life Buddy key. Falls back to key 1 only if key 2 is missing
     const key3 = (env.GEMINI_API_KEY_3 || "").trim(); // accounting only: no fallback, so it never drains the others
+    const key4 = (env.GEMINI_API_KEY_4 || "").trim() || key1; // Assignment Helper. Never shares Life Buddy's key
     const BASE = "https://generativelanguage.googleapis.com/v1beta/";
     const PREFERRED = (env.GEMINI_MODEL || "").trim() || "gemini-3.8-flash";
 
@@ -138,6 +147,11 @@ export default {
     // GET = health check. GET ?models = models key 1 can use. GET ?models&key=2 = same for key 2.
     if (request.method === "GET") {
       const url = new URL(request.url);
+      if (url.searchParams.has("ping") || url.searchParams.has("models")) {
+        // Test pages spend Gemini calls, so they are locked behind a secret token.
+        const tok = (env.ADMIN_TOKEN || "").trim();
+        if (!tok || url.searchParams.get("token") !== tok) return json({ error: "Not available." }, 403);
+      }
       if (url.searchParams.has("ping")) {
         const kn = url.searchParams.get("key");
         const k = kn === "2" ? (env.GEMINI_API_KEY_2 || "").trim() : kn === "3" ? (env.GEMINI_API_KEY_3 || "").trim() : key1;
@@ -209,7 +223,7 @@ export default {
       const device = /^[a-z0-9]{8,40}$/i.test(body.device || "") ? body.device : "";
       const mode = body.mode === "acct" ? "accounting" : ["chat", "life", "accounting", "assign"].includes(body.mode) ? body.mode : "cards";
       const kind = mode === "chat" ? "chat" : mode === "life" ? "life" : mode === "accounting" ? "acct" : mode === "assign" ? "assign" : "cards";
-      const apiKey = mode === "life" || mode === "assign" ? key2 : mode === "accounting" ? key3 : key1; // chat + cards use key 1
+      const apiKey = mode === "life" ? key2 : mode === "assign" ? key4 : mode === "accounting" ? key3 : key1; // chat + cards use key 1
       if (!apiKey) return json({ error: { message: mode === "accounting" ? "The Accounting Companion key (GEMINI_API_KEY_3) is not set up on the server." : "The AI key is not set up on the server." } }, 500);
 
       const generationFor = (model, extra, think) => {
@@ -373,6 +387,10 @@ export default {
       if (mode === "accounting") {
         if (body.name !== undefined && !/^kate$/i.test(String(body.name || "").trim()))
           return json({ error: { message: "The Accounting Companion is not available for this profile." } }, 403);
+        // Optional real lock: set ACCT_PASS on Cloudflare and send the same value as body.pass from the app.
+        const acctPass = (env.ACCT_PASS || "").trim();
+        if (acctPass && String(body.pass || "") !== acctPass)
+          return json({ error: { message: "The Accounting Companion is not available for this profile." } }, 403);
         const question = (body.question || "").toString().slice(0, 1500).trim();
         const attempt = (body.attempt || "").toString().slice(0, 2500).trim();
         const doc = (body.doc || body.context || "").toString().slice(0, 45000);
@@ -398,11 +416,11 @@ export default {
         else turns.push({ role: "user", parts: [{ text: msg }] });
 
         const system = ACCT_SYSTEM + "\n\nASSESSMENT DOCUMENT (source of truth):\n" + (doc || "(No document uploaded yet. Ask the student to add it first.)");
-        const out = await askGemini(turns, { maxOutputTokens: 1500 }, system, { think: "medium", firstMs: 40000, deadlineMs: 60000 });
+        const out = await askGemini(turns, { maxOutputTokens: 1500 }, system, { think: "medium", deadlineMs: 60000 });
         return finish(guardAcct(out), q);
       }
 
-      // Mode: assignment helper (key 2, shared with Life Buddy)
+      // Mode: assignment helper (key 4, or key 1 if key 4 is not set)
       if (mode === "assign") {
         const ASSIGN_SYSTEM = `You are a patient, friendly homework helper inside a student's study app. If images are attached, read them carefully (handwriting, printed questions, diagrams) and say briefly what you see. Explain step by step so the student understands the method, not just the result. Worked solutions are fine when you explain each step. Keep answers focused: short paragraphs or a numbered list, no more than about 10 lines. If the question is unclear or the image is blurry, ask one specific question. Reply in the language the student writes in (English, Tagalog or Taglish). Stay on schoolwork.`;
         const question = (body.question || "").toString().slice(0, 1500).trim();
