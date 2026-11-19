@@ -9,8 +9,10 @@
 //                         Flashcard Maker, Assignment Ask (with or without files).
 //     GEMINI_API_KEY3   = Gemini key 3 (GEMINI_API_KEY_3 is also accepted).
 //                         Accounting Companion only. No fallback, so it never drains another key.
-//     GROQ_MODEL        = optional override. Default is llama-3.3-70b-versatile;
-//                         llama-3.1-8b-instant is used automatically as a fast retry.
+//     GROQ_MODEL        = optional override. Default is openai/gpt-oss-120b;
+//                         openai/gpt-oss-20b is used automatically as a fast retry.
+//                         (Groq retired llama-3.3-70b-versatile and llama-3.1-8b-instant
+//                         for self-serve keys on 16 Aug 2026, so they no longer work.)
 //     ALLOWED_ORIGIN    = https://jajax2008.github.io   (comma-separate several if needed)
 //                         The Android app origins (https://localhost, http://localhost,
 //                         capacitor://localhost) are always allowed automatically.
@@ -133,8 +135,20 @@ export default {
     const BASE = "https://generativelanguage.googleapis.com/v1beta/";
     const PREFERRED = (env.GEMINI_MODEL || "").trim() || "gemini-3.8-flash";
     const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-    const GROQ_MODEL = (env.GROQ_MODEL || "").trim() || "llama-3.3-70b-versatile";
-    const GROQ_FAST_MODEL = "llama-3.1-8b-instant";
+    // Groq shut down llama-3.3-70b-versatile and llama-3.1-8b-instant for free and
+    // developer-tier keys on 16 Aug 2026. The GPT-OSS models are the replacements.
+    const GROQ_MODEL = (env.GROQ_MODEL || "").trim() || "openai/gpt-oss-120b";
+    const GROQ_FAST_MODEL = "openai/gpt-oss-20b";
+    // If a model is retired again, the next id here is tried automatically instead of failing.
+    const GROQ_MODELS = [GROQ_MODEL, GROQ_FAST_MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+    const isGptOss = (model) => /gpt-oss/i.test(model);
+    // "The model ... does not exist or you do not have access to it" (404) means try the next id.
+    const groqModelGone = (r) =>
+      r &&
+      !r.ok &&
+      (r.status === 404 ||
+        (r.status === 400 && /model/i.test(r.message || "")) ||
+        /does not exist|do not have access|not found|decommission|not supported/i.test(r.message || ""));
 
     // Groq uses the OpenAI-compatible chat completions endpoint.
     // Returns { ok, text, model, usage } or { ok:false, status, message }.
@@ -150,9 +164,13 @@ export default {
             model,
             messages,
             temperature: typeof opts.temperature === "number" ? opts.temperature : 0.6,
-            max_tokens: opts.maxTokens || 1200,
+            // max_tokens is deprecated on Groq; reasoning tokens count against this budget,
+            // so GPT-OSS gets a floor to avoid an empty reply (only reasoning, no text).
+            max_completion_tokens: Math.max(opts.maxTokens || 1200, isGptOss(model) ? 900 : 0),
             top_p: 1,
             stream: false,
+            // GPT-OSS only accepts low/medium/high. "low" keeps chat replies fast.
+            ...(isGptOss(model) ? { reasoning_effort: opts.reasoningEffort || "low" } : {}),
           }),
           signal: ac.signal,
         });
@@ -172,6 +190,19 @@ export default {
       } finally {
         clearTimeout(timer);
       }
+    }
+
+    // Tries the requested Groq model, then the other known ids if that one was retired
+    // or is not enabled for this key. Stops immediately on quota/network errors.
+    async function askGroqChain(messages, opts = {}) {
+      const start = opts.model || GROQ_MODEL;
+      const order = [start, ...GROQ_MODELS.filter((m) => m !== start)];
+      let last = { ok: false, status: 0, message: "Groq is not available" };
+      for (const model of order) {
+        last = await askGroq(messages, { ...opts, model });
+        if (last.ok || !groqModelGone(last)) return last;
+      }
+      return last;
     }
 
     // Compares versions like 3.8 vs 3.10 correctly (parseFloat would get this wrong).
@@ -216,8 +247,8 @@ export default {
         if (kn === "groq") {
           if (!groqKey) return json({ error: "Missing GROQ_API_KEY" }, 500);
           const t0 = Date.now();
-          const r = await askGroq([{ role: "user", content: "Reply with the single word OK." }], {
-            maxTokens: 10,
+          const r = await askGroqChain([{ role: "user", content: "Reply with the single word OK." }], {
+            maxTokens: 60,
             temperature: 0,
             deadlineMs: 15000,
           });
@@ -349,16 +380,23 @@ export default {
         const callModel = async (model, think) => {
           const ac = new AbortController();
           controllers.push(ac);
+          // A single slow model must not eat the whole deadline: give up on it after
+          // opts.attemptMs so the hedged model (or the next one) can answer.
+          const cut = opts.attemptMs ? setTimeout(() => { try { ac.abort(); } catch (e) {} }, opts.attemptMs) : null;
           const payload = { contents, generationConfig: generationFor(model, extraConfig, think) };
           if (systemText) payload.systemInstruction = { parts: [{ text: systemText }] };
-          const res = await fetch(`${BASE}models/${model}:generateContent`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "x-goog-api-key": callKey },
-            body: JSON.stringify(payload),
-            signal: ac.signal,
-          });
-          const data = await res.json().catch(() => ({}));
-          return { res, data };
+          try {
+            const res = await fetch(`${BASE}models/${model}:generateContent`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-goog-api-key": callKey },
+              body: JSON.stringify(payload),
+              signal: ac.signal,
+            });
+            const data = await res.json().catch(() => ({}));
+            return { res, data };
+          } finally {
+            if (cut) clearTimeout(cut);
+          }
         };
 
         const attempt = async (model) => {
@@ -489,7 +527,7 @@ export default {
       async function askAssistant(msgs, system, opts = {}) {
         const problems = [];
         if (groqKey) {
-          const first = await askGroq(toGroq(msgs, system), opts.groq || {});
+          const first = await askGroqChain(toGroq(msgs, system), opts.groq || {});
           if (first.ok) return { status: 200, data: geminiShape(first.text, first.model, first.usage) };
           problems.push("groq: " + first.message);
           // One quick retry on the small, faster model for rate limits and brief outages.
@@ -509,7 +547,14 @@ export default {
             data: { error: { message: "No AI key is set up on the server. Add GROQ_API_KEY or GEMINI_API_KEY2." } },
           };
         }
-        const out = await askGemini(toGemini(msgs), opts.geminiExtra || {}, system, opts.gemini || {});
+        // Hedge sooner and cut each slow model short: gemini-3.8-flash sometimes stalls
+        // or answers 503, and the old 46s deadline meant the whole fallback never answered.
+        const out = await askGemini(toGemini(msgs), opts.geminiExtra || {}, system, {
+          hedgeMs: 9000,
+          attemptMs: 20000,
+          deadlineMs: 42000,
+          ...opts.gemini,
+        });
         if (out.status !== 200 && problems.length && out.data && out.data.error) {
           out.data.error.message =
             problems.join(" | ") + (out.data.error.message ? " | " + out.data.error.message : "");
