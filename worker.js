@@ -2,10 +2,15 @@
 //
 // Cloudflare setup (Workers > your worker > Settings):
 //   Secrets / Variables:
-//     GEMINI_API_KEY    = key 1  (StudyBuddy chat + summaries + flashcards)
-//     GEMINI_API_KEY_2  = key 2  (Life Buddy only)
-//     GEMINI_API_KEY_3  = key 3  (Accounting Companion only, no fallback)
-//     GEMINI_API_KEY_4  = key 4  (optional: Assignment Helper. Falls back to key 1, never key 2)
+//     GROQ_API_KEY      = Groq key. Plain text chat for StudyBuddy + Life Buddy.
+//     GEMINI_API_KEY2   = Gemini key 2 (GEMINI_API_KEY_2, GEMINI_API_KEY_4 and GEMINI_API_KEY
+//                         are accepted as fallbacks for older setups).
+//                         Used for: StudyBuddy with an attached file, AI Summarizer,
+//                         Flashcard Maker, Assignment Ask (with or without files).
+//     GEMINI_API_KEY3   = Gemini key 3 (GEMINI_API_KEY_3 is also accepted).
+//                         Accounting Companion only. No fallback, so it never drains another key.
+//     GROQ_MODEL        = optional override. Default is llama-3.3-70b-versatile;
+//                         llama-3.1-8b-instant is used automatically as a fast retry.
 //     ALLOWED_ORIGIN    = https://jajax2008.github.io   (comma-separate several if needed)
 //                         The Android app origins (https://localhost, http://localhost,
 //                         capacitor://localhost) are always allowed automatically.
@@ -108,12 +113,66 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
     if (!originOk) return json({ error: { message: "Not allowed from this site." } }, 403);
 
-    const key1 = (env.GEMINI_API_KEY || "").trim();
-    const key2 = (env.GEMINI_API_KEY_2 || "").trim() || key1; // Life Buddy key. Falls back to key 1 only if key 2 is missing
-    const key3 = (env.GEMINI_API_KEY_3 || "").trim(); // accounting only: no fallback, so it never drains the others
-    const key4 = (env.GEMINI_API_KEY_4 || "").trim() || key1; // Assignment Helper. Never shares Life Buddy's key
+    const envKey = (...names) => {
+      for (const name of names) {
+        const value = (env[name] || "").trim();
+        if (value) return value;
+      }
+      return "";
+    };
+
+    // Gemini key 2: files in StudyBuddy, summarizer, flashcards, Assignment Ask.
+    // Both spellings of the secret are accepted, plus the older names, so an existing
+    // deployment keeps working while the new names are added in Cloudflare.
+    const gemini2 = envKey("GEMINI_API_KEY2", "GEMINI_API_KEY_2", "GEMINI_API_KEY_4", "GEMINI_API_KEY");
+    // Gemini key 3: Accounting Companion only. No fallback by design.
+    const gemini3 = envKey("GEMINI_API_KEY3", "GEMINI_API_KEY_3");
+    // Groq: plain text chat for StudyBuddy and Life Buddy.
+    const groqKey = envKey("GROQ_API_KEY");
+
     const BASE = "https://generativelanguage.googleapis.com/v1beta/";
     const PREFERRED = (env.GEMINI_MODEL || "").trim() || "gemini-3.8-flash";
+    const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+    const GROQ_MODEL = (env.GROQ_MODEL || "").trim() || "llama-3.3-70b-versatile";
+    const GROQ_FAST_MODEL = "llama-3.1-8b-instant";
+
+    // Groq uses the OpenAI-compatible chat completions endpoint.
+    // Returns { ok, text, model, usage } or { ok:false, status, message }.
+    async function askGroq(messages, opts = {}) {
+      const model = opts.model || GROQ_MODEL;
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), opts.deadlineMs || 25000);
+      try {
+        const res = await fetch(GROQ_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + groqKey },
+          body: JSON.stringify({
+            model,
+            messages,
+            temperature: typeof opts.temperature === "number" ? opts.temperature : 0.6,
+            max_tokens: opts.maxTokens || 1200,
+            top_p: 1,
+            stream: false,
+          }),
+          signal: ac.signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const msg = (data.error && (data.error.message || data.error.code)) || "status " + res.status;
+          return { ok: false, status: res.status, message: String(msg).slice(0, 160) };
+        }
+        const text = String(
+          (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || ""
+        ).trim();
+        if (!text) return { ok: false, status: 502, message: "Groq returned an empty reply" };
+        return { ok: true, text, model: data.model || model, usage: data.usage };
+      } catch (e) {
+        const timeout = e && e.name === "AbortError";
+        return { ok: false, status: timeout ? 504 : 0, message: timeout ? "Groq timed out" : String((e && e.message) || e) };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
 
     // Compares versions like 3.8 vs 3.10 correctly (parseFloat would get this wrong).
     const verCmp = (a, b) => {
@@ -154,8 +213,29 @@ export default {
       }
       if (url.searchParams.has("ping")) {
         const kn = url.searchParams.get("key");
-        const k = kn === "2" ? (env.GEMINI_API_KEY_2 || "").trim() : kn === "3" ? (env.GEMINI_API_KEY_3 || "").trim() : key1;
-        if (!k) return json({ error: "Missing key " + (kn || "1") }, 500);
+        if (kn === "groq") {
+          if (!groqKey) return json({ error: "Missing GROQ_API_KEY" }, 500);
+          const t0 = Date.now();
+          const r = await askGroq([{ role: "user", content: "Reply with the single word OK." }], {
+            maxTokens: 10,
+            temperature: 0,
+            deadlineMs: 15000,
+          });
+          return json(
+            {
+              key: "groq",
+              provider: "groq",
+              model: r.model || GROQ_MODEL,
+              status: r.ok ? 200 : r.status,
+              seconds: +((Date.now() - t0) / 1000).toFixed(1),
+              reply: r.ok ? r.text : null,
+              error: r.ok ? null : r.message,
+            },
+            r.ok ? 200 : 502
+          );
+        }
+        const k = kn === "3" ? gemini3 : gemini2;
+        if (!k) return json({ error: "Missing key " + (kn || "2") }, 500);
         const model = url.searchParams.get("model") || PREFERRED;
         const t0 = Date.now();
         const ac = new AbortController();
@@ -183,7 +263,7 @@ export default {
       }
       if (url.searchParams.has("models")) {
         const kn = url.searchParams.get("key");
-        const k = kn === "2" ? (env.GEMINI_API_KEY_2 || "").trim() : kn === "3" ? key3 : key1;
+        const k = kn === "3" ? gemini3 : gemini2;
         if (!k) return json({ error: "Missing key" }, 500);
         try {
           return json({ models: await listModels(k) });
@@ -191,7 +271,19 @@ export default {
           return json({ error: "Could not list models: " + e.message }, 504);
         }
       }
-      return json({ ok: true, hasKey: !!key1, hasKey2: !!(env.GEMINI_API_KEY_2 || "").trim(), hasKey3: !!key3, hasQuota: !!env.QUOTA, restricted: allowed.length > 0 });
+      return json({
+        ok: true,
+        hasGroq: !!groqKey,
+        groqModel: GROQ_MODEL,
+        hasGemini2: !!gemini2,
+        hasGemini3: !!gemini3,
+        // Kept for older clients that read these names.
+        hasKey: !!gemini2,
+        hasKey2: !!gemini2,
+        hasKey3: !!gemini3,
+        hasQuota: !!env.QUOTA,
+        restricted: allowed.length > 0,
+      });
     }
 
     if (request.method !== "POST") return json({ error: { message: "Method not allowed" } }, 405);
@@ -223,8 +315,9 @@ export default {
       const device = /^[a-z0-9]{8,40}$/i.test(body.device || "") ? body.device : "";
       const mode = body.mode === "acct" ? "accounting" : ["chat", "life", "accounting", "assign"].includes(body.mode) ? body.mode : "cards";
       const kind = mode === "chat" ? "chat" : mode === "life" ? "life" : mode === "accounting" ? "acct" : mode === "assign" ? "assign" : "cards";
-      const apiKey = mode === "life" ? key2 : mode === "assign" ? key4 : mode === "accounting" ? key3 : key1; // chat + cards use key 1
-      if (!apiKey) return json({ error: { message: mode === "accounting" ? "The Accounting Companion key (GEMINI_API_KEY_3) is not set up on the server." : "The AI key is not set up on the server." } }, 500);
+
+      const needGemini = (key, names) =>
+        !key ? json({ error: { message: "The " + names + " key is not set up on the server." } }, 500) : null;
 
       const generationFor = (model, extra, think) => {
         const cfg = { ...extra };
@@ -246,6 +339,8 @@ export default {
       // a second model is started in parallel (and a third if needed). The first good answer wins
       // and the rest are cancelled. Always answers before the deadline, so the app never times out first.
       async function askGemini(contents, extraConfig, systemText, opts = {}) {
+        const callKey = opts.key || gemini2; // Gemini key 2 unless a branch asks for key 3
+        if (!callKey) return { status: 503, data: { error: { message: "No Gemini key is set up on the server." } } };
         const deadline = opts.deadlineMs || 46000;
         const hedgeMs = opts.hedgeMs || 14000;
         const problems = [];
@@ -258,7 +353,7 @@ export default {
           if (systemText) payload.systemInstruction = { parts: [{ text: systemText }] };
           const res = await fetch(`${BASE}models/${model}:generateContent`, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+            headers: { "Content-Type": "application/json", "x-goog-api-key": callKey },
             body: JSON.stringify(payload),
             signal: ac.signal,
           });
@@ -317,7 +412,7 @@ export default {
             if (!queue.length && !discovered) {
               discovered = true;
               try {
-                const ids = await listModels(apiKey);
+                const ids = await listModels(callKey);
                 const others = ids
                   .filter((id) => /^gemini-[\d.]+-flash(-lite)?$/.test(id) && !tried.has(id))
                   .sort((a, b) => verCmp(b, a) || b.includes("lite") - a.includes("lite"));
@@ -345,6 +440,83 @@ export default {
         });
       }
 
+      // ---- Shared helpers: Groq for text, Gemini for files and structured work ----
+      // App history is { role: "user" | "model", text }. Merge same-role turns and always
+      // start with a user turn, which both providers accept.
+      const mergeHistory = (raw, maxTurns, maxLen) => {
+        const out = [];
+        for (const h of (Array.isArray(raw) ? raw : []).slice(-maxTurns)) {
+          const role = h && h.role === "model" ? "assistant" : h && h.role === "user" ? "user" : null;
+          const text = h && typeof h.text === "string" ? h.text.trim().slice(0, maxLen) : "";
+          if (!role || !text) continue;
+          const last = out[out.length - 1];
+          if (last && last.role === role) last.text += "\n" + text;
+          else out.push({ role, text });
+        }
+        while (out.length && out[0].role !== "user") out.shift();
+        return out;
+      };
+      const pushUser = (msgs, text) => {
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === "user") last.text += "\n" + text;
+        else msgs.push({ role: "user", text });
+        return msgs;
+      };
+      const toGemini = (msgs) => {
+        const turns = [];
+        for (const m of msgs) {
+          const role = m.role === "assistant" ? "model" : "user";
+          const last = turns[turns.length - 1];
+          if (last && last.role === role) last.parts[0].text += "\n" + m.text;
+          else turns.push({ role, parts: [{ text: m.text }] });
+        }
+        while (turns.length && turns[0].role !== "user") turns.shift();
+        return turns;
+      };
+      const toGroq = (msgs, system) => [
+        { role: "system", content: system },
+        ...msgs.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text })),
+      ];
+      // The app reads the Gemini reply shape, so Groq answers are wrapped in it.
+      const geminiShape = (text, model, usage) => ({
+        candidates: [{ content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
+        model,
+        provider: "groq",
+        ...(usage ? { usage } : {}),
+      });
+
+      // Groq first for plain text; Gemini key 2 as the fallback if Groq is unavailable.
+      async function askAssistant(msgs, system, opts = {}) {
+        const problems = [];
+        if (groqKey) {
+          const first = await askGroq(toGroq(msgs, system), opts.groq || {});
+          if (first.ok) return { status: 200, data: geminiShape(first.text, first.model, first.usage) };
+          problems.push("groq: " + first.message);
+          // One quick retry on the small, faster model for rate limits and brief outages.
+          if ([0, 429, 500, 502, 503].includes(first.status)) {
+            const retry = await askGroq(toGroq(msgs, system), {
+              ...(opts.groq || {}),
+              model: GROQ_FAST_MODEL,
+              maxTokens: Math.min((opts.groq && opts.groq.maxTokens) || 1200, 900),
+            });
+            if (retry.ok) return { status: 200, data: geminiShape(retry.text, retry.model, retry.usage) };
+            problems.push("groq-fast: " + retry.message);
+          }
+        }
+        if (!gemini2) {
+          return {
+            status: 503,
+            data: { error: { message: "No AI key is set up on the server. Add GROQ_API_KEY or GEMINI_API_KEY2." } },
+          };
+        }
+        const out = await askGemini(toGemini(msgs), opts.geminiExtra || {}, system, opts.gemini || {});
+        if (out.status !== 200 && problems.length && out.data && out.data.error) {
+          out.data.error.message =
+            problems.join(" | ") + (out.data.error.message ? " | " + out.data.error.message : "");
+        }
+        return out;
+      }
+
       const finish = async (out, q) => {
         if (out.status === 200 && q && q.commit) await q.commit();
         return json(out.data, out.status);
@@ -352,7 +524,7 @@ export default {
       const limitReply = () =>
         json({ error: { message: "Daily limit reached. It resets at midnight.", code: "limit" } }, 429);
 
-      // Mode: Life Buddy (key 2)
+      // Mode: Life Buddy (Groq, same key as StudyBuddy text chat)
       if (mode === "life") {
         const question = (body.question || "").toString().slice(0, 1000).trim();
         if (!question) return json({ error: { message: "Please write a message." } }, 400);
@@ -363,23 +535,13 @@ export default {
         const q = await checkQuota("life", device);
         if (!q.ok) return limitReply();
 
-        // Recent turns for context. Roles alternate and the last turn is always the new message.
-        const turns = [];
-        const hist = Array.isArray(body.history) ? body.history.slice(-8) : [];
-        for (const h of hist) {
-          const role = h && h.role === "model" ? "model" : h && h.role === "user" ? "user" : null;
-          const text = h && typeof h.text === "string" ? h.text.slice(0, 600) : "";
-          if (!role || !text) continue;
-          const last = turns[turns.length - 1];
-          if (last && last.role === role) last.parts[0].text += "\n" + text;
-          else turns.push({ role, parts: [{ text }] });
-        }
-        while (turns.length && turns[0].role !== "user") turns.shift();
-        const lastT = turns[turns.length - 1];
-        if (lastT && lastT.role === "user") lastT.parts[0].text += "\n" + question;
-        else turns.push({ role: "user", parts: [{ text: question }] });
-
-        const out = await askGemini(turns, { maxOutputTokens: 1000, temperature: 0.7 }, LIFE_SYSTEM);
+        // Life Buddy runs on Groq (shared with StudyBuddy text chat) for speed.
+        const msgs = mergeHistory(body.history, 8, 600);
+        pushUser(msgs, question);
+        const out = await askAssistant(msgs, LIFE_SYSTEM, {
+          groq: { maxTokens: 700, temperature: 0.7 },
+          geminiExtra: { maxOutputTokens: 1000, temperature: 0.7 },
+        });
         return finish(out, q);
       }
 
@@ -395,6 +557,10 @@ export default {
         const attempt = (body.attempt || "").toString().slice(0, 2500).trim();
         const doc = (body.doc || body.context || "").toString().slice(0, 45000);
         if (attempt.length < 3) return json({ error: { message: "Write your own attempt first, even a rough one." } }, 400);
+
+        // Accounting always uses Gemini key 3, never Groq and never key 2.
+        const missing = needGemini(gemini3, "Accounting Companion (GEMINI_API_KEY3)");
+        if (missing) return missing;
 
         const q = await checkQuota("acct", device);
         if (!q.ok) return limitReply();
@@ -416,16 +582,25 @@ export default {
         else turns.push({ role: "user", parts: [{ text: msg }] });
 
         const system = ACCT_SYSTEM + "\n\nASSESSMENT DOCUMENT (source of truth):\n" + (doc || "(No document uploaded yet. Ask the student to add it first.)");
-        const out = await askGemini(turns, { maxOutputTokens: 1500 }, system, { think: "medium", deadlineMs: 60000 });
+        const out = await askGemini(turns, { maxOutputTokens: 1500 }, system, {
+          key: gemini3,
+          think: "medium",
+          deadlineMs: 60000,
+        });
+
         return finish(guardAcct(out), q);
       }
 
-      // Mode: assignment helper (key 4, or key 1 if key 4 is not set)
+      // Mode: Assignment Ask (always Gemini key 2, with or without attached files)
       if (mode === "assign") {
         const ASSIGN_SYSTEM = `You are a patient, friendly homework helper inside a student's study app. If images are attached, read them carefully (handwriting, printed questions, diagrams) and say briefly what you see. Explain step by step so the student understands the method, not just the result. Worked solutions are fine when you explain each step. Keep answers focused: short paragraphs or a numbered list, no more than about 10 lines. If the question is unclear or the image is blurry, ask one specific question. Reply in the language the student writes in (English, Tagalog or Taglish). Stay on schoolwork.`;
         const question = (body.question || "").toString().slice(0, 1500).trim();
-        const imgs = (Array.isArray(body.images) ? body.images : []).slice(0, 3).filter((m) => m && typeof m.data === "string" && m.data.length < 3000000 && /^image\/(jpeg|png|webp)$/.test(m.mime || ""));
+        const imgs = (Array.isArray(body.images) ? body.images : [])
+          .slice(0, 3)
+          .filter((m) => m && typeof m.data === "string" && m.data.length < 6000000 && /^(image\/(jpeg|jpg|png|webp|heic|heif|gif)|application\/pdf)$/i.test(m.mime || ""));
         if (!question && !imgs.length) return json({ error: { message: "Please write a question or add an image." } }, 400);
+        const missing = needGemini(gemini2, "file-analysis (GEMINI_API_KEY2)");
+        if (missing) return missing;
         const q = await checkQuota("assign", device);
         if (!q.ok) return limitReply();
         const turns = [];
@@ -444,31 +619,83 @@ export default {
         const lastT = turns[turns.length - 1];
         if (lastT && lastT.role === "user") lastT.parts.push(...parts);
         else turns.push({ role: "user", parts });
-        const out = await askGemini(turns, { maxOutputTokens: 2000 }, ASSIGN_SYSTEM, { deadlineMs: 60000 });
+        const out = await askGemini(turns, { maxOutputTokens: 2000 }, ASSIGN_SYSTEM, { key: gemini2, deadlineMs: 60000 });
         return finish(out, q);
       }
 
-      // Mode: StudyBuddy chat (key 1)
+      // Mode: StudyBuddy chat.
+      //   no attachments -> Groq (the same key Life Buddy uses)
+      //   attachments    -> Gemini key 2 reads the file; its answer stays in the chat so
+      //                     later Groq turns can use that analysis as context.
       if (mode === "chat") {
         const question = (body.question || "").toString().slice(0, 2000);
         const context = (body.context || "").toString().slice(0, 30000);
+        const analysis = (body.analysis || "").toString().slice(0, 12000);
         const source = body.source || "web";
         if (!question) return json({ error: { message: "Please enter a question." } }, 400);
 
         const q = await checkQuota("chat", device);
         if (!q.ok) return limitReply();
 
-        const prompt =
-          source === "notes"
-            ? `You are StudyBuddy. Answer the student's question based PRIMARILY on their study notes below. If the answer is not in the notes, say so briefly and then provide the general answer.\n\nStudent's Study Notes:\n${context || "No notes provided."}\n\nQuestion:\n${question}`
-            : `You are StudyBuddy, a smart, fast academic tutor. Answer the student's question clearly and concisely using accurate general knowledge (and their notes if relevant).\n\nOptional Notes Context:\n${context || "None"}\n\nQuestion:\n${question}`;
+        const files = (Array.isArray(body.images) ? body.images : [])
+          .slice(0, 3)
+          .filter((m) => m && typeof m.data === "string" && m.data.length < 6000000 && /^(image\/(jpeg|jpg|png|webp|heic|heif|gif)|application\/pdf)$/i.test(m.mime || ""));
 
-        const cimgs = (Array.isArray(body.images) ? body.images : []).slice(0, 3).filter((m) => m && typeof m.data === "string" && m.data.length < 3000000 && /^image\/(jpeg|png|webp)$/.test(m.mime || ""));
-        const out = await askGemini([{ role: "user", parts: [{ text: prompt }, ...cimgs.map((m) => ({ inlineData: { mimeType: m.mime, data: m.data } }))] }], { maxOutputTokens: 2000 });
+        const baseSystem =
+          source === "notes"
+            ? "You are StudyBuddy, a patient academic tutor. Answer primarily from the student's study notes below. If the answer is not in the notes, say so briefly, then give the general answer."
+            : "You are StudyBuddy, a smart, fast academic tutor. Answer clearly and concisely using accurate general knowledge, and use the student's notes when they are relevant.";
+
+        // ---- attached file: Gemini key 2 does the reading ----
+        if (files.length) {
+          const missing = needGemini(gemini2, "file-analysis (GEMINI_API_KEY2)");
+          if (missing) return missing;
+
+          const hist = mergeHistory(body.history, 6, 800);
+          const fileAsk = [
+            `The student attached ${files.length} file(s).`,
+            'Start your reply with a short section headed "FILE SUMMARY:" that says what the file is and lists its key facts, numbers, instructions or questions, so this analysis can be reused as context later.',
+            "Then answer the student's question using the file.",
+            "",
+            "Student question: " + question,
+          ].join("\n");
+          const parts = [
+            { text: fileAsk },
+            ...files.map((m) => ({ inlineData: { mimeType: m.mime, data: m.data } })),
+          ];
+          const contents = toGemini(hist);
+          const lastTurn = contents[contents.length - 1];
+          if (lastTurn && lastTurn.role === "user") lastTurn.parts.push(...parts);
+          else contents.push({ role: "user", parts });
+
+          const system = baseSystem + (context ? "\n\nStudent's study notes:\n" + context : "");
+          const out = await askGemini(contents, { maxOutputTokens: 2500 }, system, {
+            key: gemini2,
+            deadlineMs: 60000,
+          });
+          return finish(out, q);
+        }
+
+        // ---- plain text: Groq, with history + any earlier file analysis ----
+        const msgs = mergeHistory(body.history, 8, 800);
+        pushUser(msgs, question);
+        let system = baseSystem;
+        if (context) system += "\n\nStudent's study notes:\n" + context;
+        if (analysis) {
+          system +=
+            "\n\nEarlier analysis of a file the student attached to this chat (written by the vision model). Treat it as established context and answer follow-up questions from it:\n" +
+            analysis;
+        }
+        const out = await askAssistant(msgs, system, {
+          groq: { maxTokens: 1200, temperature: 0.5 },
+          geminiExtra: { maxOutputTokens: 2000 },
+        });
         return finish(out, q);
       }
 
-      // Mode: flashcards and summary (key 1)
+      // Mode: AI Summarizer + Flashcard Maker (Gemini key 2)
+      const missingCards = needGemini(gemini2, "summarizer/flashcards (GEMINI_API_KEY2)");
+      if (missingCards) return missingCards;
       const text = (body.text || "").toString().trim();
       if (text.length < 30) return json({ error: { message: "Text is too short to summarize." } }, 400);
 
