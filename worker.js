@@ -319,6 +319,93 @@ export default {
 
     if (request.method !== "POST") return json({ error: { message: "Method not allowed" } }, 405);
 
+    // ---- Group Study voice rooms (audio only, max 5 people) ----
+    // Rooms live in the STUDY_ROOMS KV namespace for 4 hours after the last change.
+    // The worker only tracks who is in a room; the audio itself flows peer to peer.
+    const ROOM_TTL = 14400;
+    const ROOM_MAX = 5;
+    const roomPath = new URL(request.url).pathname.replace(/\/+$/, "");
+    if (roomPath.startsWith("/room/")) {
+      if (!env.STUDY_ROOMS) return json({ error: { message: "Study rooms are not set up on the server." } }, 500);
+      const roomBody = await request.json().catch(() => null);
+      if (!roomBody || typeof roomBody !== "object") return json({ error: { message: "Bad request." } }, 400);
+      const peerId = String(roomBody.peerId || "").slice(0, 64);
+      const userName = String(roomBody.userName || "").trim().slice(0, 24) || "Learner";
+      const roomCode = String(roomBody.roomCode || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+      const key = (code) => "room:" + code;
+      const readRoom = async (code) => {
+        const raw = await env.STUDY_ROOMS.get(key(code));
+        if (!raw) return null;
+        try {
+          return JSON.parse(raw);
+        } catch (e) {
+          return null;
+        }
+      };
+      const saveRoom = (code, data) =>
+        env.STUDY_ROOMS.put(key(code), JSON.stringify(data), { expirationTtl: ROOM_TTL });
+
+      if (roomPath === "/room/create") {
+        if (!peerId) return json({ error: { message: "Missing peer id." } }, 400);
+        // Avoid letters and digits that look alike so a code is easy to read out loud.
+        const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let code = "";
+        for (let tries = 0; tries < 8; tries++) {
+          let candidate = "";
+          for (let i = 0; i < 6; i++) candidate += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+          if (!(await readRoom(candidate))) {
+            code = candidate;
+            break;
+          }
+        }
+        if (!code) return json({ error: { message: "Could not create a room. Please try again." } }, 503);
+        await saveRoom(code, { hostPeerId: peerId, participants: [{ peerId, name: userName }], created: Date.now() });
+        return json({ roomCode: code });
+      }
+
+      if (roomPath === "/room/join") {
+        if (!peerId) return json({ error: { message: "Missing peer id." } }, 400);
+        if (roomCode.length !== 6) return json({ error: { message: "Enter the 6-character room code." } }, 400);
+        const room = await readRoom(roomCode);
+        if (!room) return json({ error: { message: "Room not found. Check the code." } }, 404);
+        const participants = Array.isArray(room.participants) ? room.participants : [];
+        const already = participants.some((p) => p && p.peerId === peerId);
+        if (!already && participants.length >= ROOM_MAX) {
+          return json({ error: { message: "Room is full (max 5 people)" } }, 403);
+        }
+        // Joining again just refreshes the name and the room lifetime; it is also
+        // how an open room screen keeps its participant list current.
+        if (already) {
+          participants.forEach((p) => {
+            if (p && p.peerId === peerId) p.name = userName;
+          });
+        } else {
+          participants.push({ peerId, name: userName });
+        }
+        room.participants = participants;
+        await saveRoom(roomCode, room);
+        return json({ participants });
+      }
+
+      if (roomPath === "/room/leave") {
+        if (roomCode.length !== 6) return json({ error: { message: "Missing room code." } }, 400);
+        const room = await readRoom(roomCode);
+        if (!room) return json({ ok: true, participants: [] });
+        room.participants = (Array.isArray(room.participants) ? room.participants : []).filter(
+          (p) => p && p.peerId !== peerId
+        );
+        if (!room.participants.length) {
+          await env.STUDY_ROOMS.delete(key(roomCode));
+          return json({ ok: true, participants: [] });
+        }
+        if (room.hostPeerId === peerId) room.hostPeerId = room.participants[0].peerId;
+        await saveRoom(roomCode, room);
+        return json({ ok: true, participants: room.participants });
+      }
+
+      return json({ error: { message: "Unknown room action." } }, 404);
+    }
+
     // ---- daily limits (per device, plus a looser per-IP cap) ----
     const ip = request.headers.get("CF-Connecting-IP") || "anon";
     async function checkQuota(kind, device) {
