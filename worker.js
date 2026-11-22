@@ -103,7 +103,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": allowed.length ? (allowed.includes(reqOrigin) ? reqOrigin : allowed[0]) : "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
       Vary: "Origin",
     };
     const json = (obj, status = 200) =>
@@ -114,6 +114,257 @@ export default {
 
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
     if (!originOk) return json({ error: { message: "Not allowed from this site." } }, 403);
+
+    /* ================= Accounts: D1 auth + private cloud sync =================
+       Passwords are PBKDF2-SHA256 (210k iterations, 16-byte random salt) and only
+       the derived hash is stored. Session tokens are HMAC-signed and expire after
+       30 days, so signing out or rotating AUTH_SECRET invalidates them. The app
+       sends the token as "Authorization: Bearer <token>". */
+    const AUTH_TTL = 30 * 86400;
+    const PBKDF2_ITER = 210000;
+    const AUTH_ENC = new TextEncoder();
+    const authB64 = (bytes) => {
+      let s = "";
+      const arr = new Uint8Array(bytes);
+      for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+      return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    };
+    const authHex = (bytes) => {
+      const arr = new Uint8Array(bytes);
+      let s = "";
+      for (let i = 0; i < arr.length; i++) s += arr[i].toString(16).padStart(2, "0");
+      return s;
+    };
+    const authEqual = (a, b) => {
+      const x = String(a || ""), y = String(b || "");
+      if (x.length !== y.length) return false;
+      let diff = 0;
+      for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
+      return diff === 0;
+    };
+    // AUTH_SECRET is the intended secret. The AI keys are only fallbacks so an
+    // existing deployment keeps working before the new secret is added.
+    const authSecret = () =>
+      String(env.AUTH_SECRET || env.GROQ_API_KEY || env.GEMINI_API_KEY2 || env.GEMINI_API_KEY || env.ADMIN_TOKEN || "").trim();
+    const authSign = async (text) => {
+      const key = await crypto.subtle.importKey("raw", AUTH_ENC.encode(authSecret()), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      return authB64(await crypto.subtle.sign("HMAC", key, AUTH_ENC.encode(text)));
+    };
+    const issueToken = async (userId) => {
+      const exp = Math.floor(Date.now() / 1000) + AUTH_TTL;
+      const payload = userId + "." + exp;
+      return payload + "." + (await authSign(payload));
+    };
+    const tokenUser = async (request) => {
+      const header = request.headers.get("Authorization") || "";
+      const match = /^Bearer\s+([A-Za-z0-9_.-]+)$/.exec(header.trim());
+      if (!match) return null;
+      const parts = match[1].split(".");
+      if (parts.length !== 3) return null;
+      const [id, exp, sig] = parts;
+      if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
+      if (!(Number(exp) > Math.floor(Date.now() / 1000))) return null;
+      const want = await authSign(id + "." + exp);
+      if (!authEqual(sig, want)) return null;
+      return id;
+    };
+    const authSalt = () => authHex(crypto.getRandomValues(new Uint8Array(16)));
+    const hashPassword = async (password, saltHex) => {
+      const salt = new Uint8Array(saltHex.match(/.{2}/g).map((h) => parseInt(h, 16)));
+      const key = await crypto.subtle.importKey("raw", AUTH_ENC.encode(password), "PBKDF2", false, ["deriveBits"]);
+      const bits = await crypto.subtle.deriveBits(
+        { name: "PBKDF2", salt, iterations: PBKDF2_ITER, hash: "SHA-256" },
+        key,
+        256
+      );
+      return authHex(bits);
+    };
+    const publicUser = (row) => ({
+      id: row.id,
+      username: row.username,
+      displayName: row.display_name || "",
+      age: row.age === null || row.age === undefined ? null : Number(row.age),
+      gradeLevel: row.grade_level || "",
+      onboardingCompleted: !!row.onboarding_completed,
+      createdAt: Number(row.created_at) || 0,
+    });
+    const readJson = async (request) => {
+      const body = await request.json().catch(() => null);
+      return body && typeof body === "object" ? body : null;
+    };
+    const cleanText = (value, max) => String(value === undefined || value === null ? "" : value).trim().slice(0, max);
+    const passwordProblem = (pw) => {
+      const s = String(pw || "");
+      if (s.length < 8) return "Use at least 8 characters for your password.";
+      if (s.length > 128) return "That password is too long (128 characters maximum).";
+      return "";
+    };
+    const dbUser = (id) => env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, "");
+    if (path === "/sync" || path === "/auth/signup" || path === "/auth/signin" || path === "/auth/onboarding" || path === "/auth/change-password" || path === "/auth/delete-account") {
+      if (!env.DB) return json({ error: { message: "Accounts are not set up on the server yet." } }, 500);
+      if (!authSecret()) return json({ error: { message: "Sign-in is not configured. Add AUTH_SECRET to the worker." } }, 500);
+
+      try {
+        if (path === "/auth/signup" && request.method === "POST") {
+          const body = await readJson(request);
+          if (!body) return json({ error: { message: "Bad request." } }, 400);
+          const username = cleanText(body.username, 24).toLowerCase();
+          const password = String(body.password || "");
+          if (!/^[a-z0-9._]{3,24}$/.test(username))
+            return json({ error: { message: "Usernames are 3 to 24 characters: letters, numbers, dots or underscores." } }, 400);
+          const pwBad = passwordProblem(password);
+          if (pwBad) return json({ error: { message: pwBad } }, 400);
+          const taken = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
+          if (taken) return json({ error: { message: "That username is already taken." } }, 409);
+          const id = crypto.randomUUID();
+          const salt = authSalt();
+          const hash = await hashPassword(password, salt);
+          const now = Date.now();
+          await env.DB.prepare(
+            "INSERT INTO users (id, username, password_hash, salt, display_name, age, grade_level, onboarding_completed, created_at) VALUES (?, ?, ?, ?, '', NULL, '', 0, ?)"
+          )
+            .bind(id, username, hash, salt, now)
+            .run();
+          const row = await dbUser(id);
+          return json({ token: await issueToken(id), user: publicUser(row) });
+        }
+
+        if (path === "/auth/signin" && request.method === "POST") {
+          const body = await readJson(request);
+          if (!body) return json({ error: { message: "Bad request." } }, 400);
+          const username = cleanText(body.username, 24).toLowerCase();
+          const password = String(body.password || "");
+          if (!username || !password) return json({ error: { message: "Enter your username and password." } }, 400);
+          const row = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(username).first();
+          const hash = row ? await hashPassword(password, row.salt) : "";
+          if (!row || !authEqual(hash, row.password_hash))
+            return json({ error: { message: "That username and password do not match." } }, 401);
+          const data = await env.DB.prepare("SELECT sync_payload, updated_at FROM user_data WHERE user_id = ?").bind(row.id).first();
+          let syncPayload = null;
+          if (data && data.sync_payload) {
+            try {
+              syncPayload = JSON.parse(data.sync_payload);
+            } catch (e) {
+              syncPayload = null;
+            }
+          }
+          return json({
+            token: await issueToken(row.id),
+            user: publicUser(row),
+            syncPayload,
+            updatedAt: data ? Number(data.updated_at) || 0 : 0,
+          });
+        }
+
+        if (path === "/auth/onboarding" && request.method === "POST") {
+          const userId = await tokenUser(request);
+          if (!userId) return json({ error: { message: "Please sign in again." }, code: "auth" }, 401);
+          const body = await readJson(request);
+          if (!body) return json({ error: { message: "Bad request." } }, 400);
+          const displayName = cleanText(body.displayName, 40);
+          const age = Number(body.age);
+          const gradeLevel = cleanText(body.gradeLevel, 40);
+          if (!displayName) return json({ error: { message: "Please enter your first name." } }, 400);
+          if (!Number.isInteger(age) || age < 5 || age > 99)
+            return json({ error: { message: "Please enter an age between 5 and 99." } }, 400);
+          if (!gradeLevel) return json({ error: { message: "Please choose your grade or year level." } }, 400);
+          await env.DB.prepare(
+            "UPDATE users SET display_name = ?, age = ?, grade_level = ?, onboarding_completed = 1 WHERE id = ?"
+          )
+            .bind(displayName, age, gradeLevel, userId)
+            .run();
+          const row = await dbUser(userId);
+          if (!row) return json({ error: { message: "That account no longer exists." } }, 404);
+          return json({ user: publicUser(row) });
+        }
+
+        if (path === "/auth/change-password" && request.method === "POST") {
+          const userId = await tokenUser(request);
+          if (!userId) return json({ error: { message: "Please sign in again." }, code: "auth" }, 401);
+          const body = await readJson(request);
+          if (!body) return json({ error: { message: "Bad request." } }, 400);
+          const current = String(body.currentPassword || "");
+          const next = String(body.newPassword || "");
+          if (!current) return json({ error: { message: "Enter your current password." } }, 400);
+          const pwBad = passwordProblem(next);
+          if (pwBad) return json({ error: { message: pwBad } }, 400);
+          const row = await dbUser(userId);
+          if (!row) return json({ error: { message: "That account no longer exists." } }, 404);
+          const currentHash = await hashPassword(current, row.salt);
+          if (!authEqual(currentHash, row.password_hash))
+            return json({ error: { message: "Your current password is not correct." } }, 403);
+          if (current === next)
+            return json({ error: { message: "Choose a password different from your current one." } }, 400);
+          const salt = authSalt();
+          const hash = await hashPassword(next, salt);
+          await env.DB.prepare("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?").bind(hash, salt, userId).run();
+          return json({ ok: true });
+        }
+
+        if (path === "/auth/delete-account" && request.method === "POST") {
+          const userId = await tokenUser(request);
+          if (!userId) return json({ error: { message: "Please sign in again." }, code: "auth" }, 401);
+          const body = await readJson(request);
+          if (!body) return json({ error: { message: "Bad request." } }, 400);
+          const password = String(body.password || "");
+          if (!password) return json({ error: { message: "Enter your password to delete the account." } }, 400);
+          const row = await dbUser(userId);
+          if (!row) return json({ ok: true });
+          const hash = await hashPassword(password, row.salt);
+          if (!authEqual(hash, row.password_hash))
+            return json({ error: { message: "That password is not correct." } }, 403);
+          await env.DB.prepare("DELETE FROM user_data WHERE user_id = ?").bind(userId).run();
+          await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
+          return json({ ok: true });
+        }
+
+        if (path === "/sync" && request.method === "GET") {
+          const userId = await tokenUser(request);
+          if (!userId) return json({ error: { message: "Please sign in again." }, code: "auth" }, 401);
+          const row = await dbUser(userId);
+          if (!row) return json({ error: { message: "That account no longer exists." }, code: "auth" }, 404);
+          const data = await env.DB.prepare("SELECT sync_payload, updated_at FROM user_data WHERE user_id = ?").bind(userId).first();
+          let syncPayload = null;
+          if (data && data.sync_payload) {
+            try {
+              syncPayload = JSON.parse(data.sync_payload);
+            } catch (e) {
+              syncPayload = null;
+            }
+          }
+          return json({ user: publicUser(row), syncPayload, updatedAt: data ? Number(data.updated_at) || 0 : 0 });
+        }
+
+        if (path === "/sync" && request.method === "POST") {
+          const userId = await tokenUser(request);
+          if (!userId) return json({ error: { message: "Please sign in again." }, code: "auth" }, 401);
+          const body = await readJson(request);
+          if (!body || !body.payload || typeof body.payload !== "object") return json({ error: { message: "Bad request." } }, 400);
+          let serialized = "";
+          try {
+            serialized = JSON.stringify(body.payload);
+          } catch (e) {
+            return json({ error: { message: "That data could not be saved." } }, 400);
+          }
+          if (serialized.length > 900000)
+            return json({ error: { message: "This account has more data than cloud sync can hold (about 900 KB)." } }, 413);
+          const now = Date.now();
+          await env.DB.prepare(
+            "INSERT INTO user_data (user_id, sync_payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET sync_payload = excluded.sync_payload, updated_at = excluded.updated_at"
+          )
+            .bind(userId, serialized, now)
+            .run();
+          return json({ ok: true, updatedAt: now });
+        }
+
+        return json({ error: { message: "Unknown account action." } }, 404);
+      } catch (err) {
+        return json({ error: { message: "The account service hit a problem. Please try again." } }, 500);
+      }
+    }
 
     const envKey = (...names) => {
       for (const name of names) {
