@@ -116,12 +116,13 @@ export default {
     if (!originOk) return json({ error: { message: "Not allowed from this site." } }, 403);
 
     /* ================= Accounts: D1 auth + private cloud sync =================
-       Passwords are PBKDF2-SHA256 (210k iterations, 16-byte random salt) and only
+       Passwords are PBKDF2-SHA256 (100k iterations, 16-byte random salt) and only
        the derived hash is stored. Session tokens are HMAC-signed and expire after
        30 days, so signing out or rotating AUTH_SECRET invalidates them. The app
        sends the token as "Authorization: Bearer <token>". */
     const AUTH_TTL = 30 * 86400;
-    const PBKDF2_ITER = 210000;
+    // Workers WebCrypto caps PBKDF2 at 100,000 iterations; the salt is unique per user.
+    const PBKDF2_ITER = 100000;
     const AUTH_ENC = new TextEncoder();
     const authB64 = (bytes) => {
       let s = "";
@@ -387,7 +388,7 @@ export default {
 
         return json({ error: { message: "Unknown account action." } }, 404);
       } catch (err) {
-        return json({ error: { message: "The account service hit a problem. Please try again.", detail: String((err && err.message) || err).slice(0, 240) } }, 500);
+        return json({ error: { message: "The account service hit a problem. Please try again." } }, 500);
       }
     }
 
