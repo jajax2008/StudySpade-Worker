@@ -210,11 +210,12 @@ export default {
       if (schemaReady) return;
       if (!schemaPromise) {
         schemaPromise = (async () => {
-          if (typeof env.DB.exec !== "function") { schemaReady = true; return; }
-          await env.DB.exec(
-            "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, display_name TEXT, age INTEGER, grade_level TEXT, onboarding_completed INTEGER DEFAULT 0, created_at INTEGER);" +
-              "CREATE TABLE IF NOT EXISTS user_data (user_id TEXT PRIMARY KEY, sync_payload TEXT NOT NULL, updated_at INTEGER);"
-          );
+          await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, display_name TEXT, age INTEGER, grade_level TEXT, onboarding_completed INTEGER DEFAULT 0, created_at INTEGER)"
+          ).run();
+          await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS user_data (user_id TEXT PRIMARY KEY, sync_payload TEXT NOT NULL, updated_at INTEGER)"
+          ).run();
           schemaReady = true;
         })().catch((e) => {
           schemaPromise = null;
@@ -386,7 +387,7 @@ export default {
 
         return json({ error: { message: "Unknown account action." } }, 404);
       } catch (err) {
-        return json({ error: { message: "The account service hit a problem. Please try again." } }, 500);
+        return json({ error: { message: "The account service hit a problem. Please try again.", detail: String((err && err.message) || err).slice(0, 240) } }, 500);
       }
     }
 
