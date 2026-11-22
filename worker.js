@@ -201,11 +201,35 @@ export default {
     };
     const dbUser = (id) => env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
 
+    /* The GitHub migration step needs a token with D1 edit rights. When the token
+       only allows Worker deploys, this one-time bootstrap creates the same
+       idempotent tables on first account request so sign-up still works. */
+    let schemaReady = false;
+    let schemaPromise = null;
+    const ensureSchema = async () => {
+      if (schemaReady) return;
+      if (!schemaPromise) {
+        schemaPromise = (async () => {
+          if (typeof env.DB.exec !== "function") { schemaReady = true; return; }
+          await env.DB.exec(
+            "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, display_name TEXT, age INTEGER, grade_level TEXT, onboarding_completed INTEGER DEFAULT 0, created_at INTEGER);" +
+              "CREATE TABLE IF NOT EXISTS user_data (user_id TEXT PRIMARY KEY, sync_payload TEXT NOT NULL, updated_at INTEGER);"
+          );
+          schemaReady = true;
+        })().catch((e) => {
+          schemaPromise = null;
+          throw e;
+        });
+      }
+      await schemaPromise;
+    };
+
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
     if (path === "/sync" || path === "/auth/signup" || path === "/auth/signin" || path === "/auth/onboarding" || path === "/auth/change-password" || path === "/auth/delete-account") {
       if (!env.DB) return json({ error: { message: "Accounts are not set up on the server yet." } }, 500);
       if (!authSecret()) return json({ error: { message: "Sign-in is not configured. Add AUTH_SECRET to the worker." } }, 500);
+      try { await ensureSchema(); } catch (e) {}
 
       try {
         if (path === "/auth/signup" && request.method === "POST") {

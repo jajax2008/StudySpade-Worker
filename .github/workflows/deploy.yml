@@ -16,7 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Creates the account tables before the Worker ships. If the repository
+      # token can deploy Workers but not edit D1, this step reports the missing
+      # permission without blocking the deploy: the Worker itself creates the
+      # same idempotent tables on the first account request.
       - name: Create or update the D1 tables
+        continue-on-error: true
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
