@@ -187,6 +187,9 @@ export default {
       age: row.age === null || row.age === undefined ? null : Number(row.age),
       gradeLevel: row.grade_level || "",
       onboardingCompleted: !!row.onboarding_completed,
+      role: String(row.role || "USER").toUpperCase(),
+      avatar: row.avatar || "",
+      bg: row.bg || "",
       createdAt: Number(row.created_at) || 0,
     });
     const readJson = async (request) => {
@@ -207,16 +210,66 @@ export default {
        idempotent tables on first account request so sign-up still works. */
     let schemaReady = false;
     let schemaPromise = null;
+    const DEV_ACCOUNTS = [
+      { username: "urdevjaja", password: "240319", name: "Jaja", age: 18, grade: "College" },
+      { username: "urdevkk", password: "240319", name: "Kate", age: 18, grade: "College" },
+    ];
+    /* The two developer accounts are seeded once per database. They always keep
+       the DEV role so both get unlimited AI and the developer tools. */
+    const seedDevAccounts = async () => {
+      for (const dev of DEV_ACCOUNTS) {
+        const existing = await env.DB.prepare("SELECT id, role FROM users WHERE username = ?").bind(dev.username).first();
+        if (existing) {
+          if (String(existing.role || "").toUpperCase() !== "DEV") {
+            await env.DB.prepare("UPDATE users SET role = 'DEV' WHERE id = ?").bind(existing.id).run();
+          }
+          continue;
+        }
+        const id = crypto.randomUUID();
+        const salt = authSalt();
+        const hash = await hashPassword(dev.password, salt);
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO users (id, username, password_hash, salt, display_name, age, grade_level, onboarding_completed, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'DEV', ?)"
+        )
+          .bind(id, dev.username, hash, salt, dev.name, dev.age, dev.grade, Date.now())
+          .run();
+      }
+    };
     const ensureSchema = async () => {
       if (schemaReady) return;
       if (!schemaPromise) {
         schemaPromise = (async () => {
           await env.DB.prepare(
-            "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, display_name TEXT, age INTEGER, grade_level TEXT, onboarding_completed INTEGER DEFAULT 0, created_at INTEGER)"
+            "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, display_name TEXT, age INTEGER, grade_level TEXT, onboarding_completed INTEGER DEFAULT 0, role TEXT DEFAULT 'USER', avatar TEXT DEFAULT '', bg TEXT DEFAULT '', created_at INTEGER)"
           ).run();
           await env.DB.prepare(
             "CREATE TABLE IF NOT EXISTS user_data (user_id TEXT PRIMARY KEY, sync_payload TEXT NOT NULL, updated_at INTEGER)"
           ).run();
+          /* Databases created before profile customisation need the new columns. */
+          for (const ddl of [
+            "ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'USER'",
+            "ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN bg TEXT DEFAULT ''",
+          ]) {
+            try { await env.DB.prepare(ddl).run(); } catch (e) {}
+          }
+          const tables = [
+            "CREATE TABLE IF NOT EXISTS friends (a TEXT NOT NULL, b TEXT NOT NULL, created_at INTEGER, PRIMARY KEY (a, b))",
+            "CREATE TABLE IF NOT EXISTS friend_requests (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at INTEGER)",
+            "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER, read_at INTEGER)",
+            "CREATE TABLE IF NOT EXISTS pokes (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, created_at INTEGER, read_at INTEGER)",
+            "CREATE TABLE IF NOT EXISTS room_invites (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, room_code TEXT NOT NULL, status TEXT DEFAULT 'pending', reason TEXT DEFAULT '', created_at INTEGER, responded_at INTEGER)",
+            "CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, owner TEXT NOT NULL, category TEXT NOT NULL, message TEXT NOT NULL, status TEXT DEFAULT 'open', created_at INTEGER)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_to ON messages (to_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages (from_id, to_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_pokes_to ON pokes (to_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_invites_to ON room_invites (to_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_to ON friend_requests (to_id, status)",
+          ];
+          for (const ddl of tables) {
+            try { await env.DB.prepare(ddl).run(); } catch (e) {}
+          }
+          await seedDevAccounts();
           schemaReady = true;
         })().catch((e) => {
           schemaPromise = null;
@@ -389,6 +442,427 @@ export default {
         return json({ error: { message: "Unknown account action." } }, 404);
       } catch (err) {
         return json({ error: { message: "The account service hit a problem. Please try again." } }, 500);
+      }
+    }
+
+    /* ================= Friends, chat, pokes, room invites, reports =================
+       Every route below needs a signed-in account; the user id always comes from
+       the session token, never from the request body. */
+    const SOCIAL_PATHS = new Set([
+      "/friends", "/friends/request", "/friends/accept", "/friends/decline",
+      "/friends/search", "/friends/profile", "/profile/update",
+      "/chat/threads", "/chat/messages", "/chat/send", "/chat/poke", "/chat/pokes",
+      "/room/invite", "/room/invites", "/room/invites/respond", "/room/invites/sent",
+      "/reports/submit", "/reports/list", "/reports/update",
+    ]);
+    if (SOCIAL_PATHS.has(path)) {
+      if (!env.DB) return json({ error: { message: "Accounts are not set up on the server yet." } }, 500);
+      if (!authSecret()) return json({ error: { message: "Sign-in is not configured." } }, 500);
+      try { await ensureSchema(); } catch (e) {}
+      try {
+        const userId = await tokenUser(request);
+        if (!userId) return json({ error: { message: "Please sign in again.", code: "auth" } }, 401);
+        const meRow = await dbUser(userId);
+        if (!meRow) return json({ error: { message: "That account no longer exists.", code: "auth" } }, 404);
+        const isOwnerDev = meRow.username === "urdevjaja";
+        const body = request.method === "GET" ? {} : (await readJson(request)) || {};
+
+        const statsFor = async (id) => {
+          const out = { focus: 0, streak: 0, open: 0 };
+          try {
+            const d = await env.DB.prepare("SELECT sync_payload FROM user_data WHERE user_id = ?").bind(id).first();
+            if (!d || !d.sync_payload) return out;
+            const payload = JSON.parse(d.sync_payload);
+            const data = (payload && payload.data) || {};
+            const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+            out.focus = sessions.reduce((a, s) => a + (Number(s && s.min) || 0), 0);
+            const days = new Set(sessions.map((s) => String((s && s.date) || "")).filter(Boolean));
+            const key = (t) => new Date(t).toISOString().slice(0, 10);
+            let at = Date.now();
+            if (!days.has(key(at))) at -= 86400000;
+            while (days.has(key(at)) && out.streak < 3650) {
+              out.streak++;
+              at -= 86400000;
+            }
+            const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+            out.open = tasks.filter((t) => t && !t.done).length;
+          } catch (e) {}
+          return out;
+        };
+        const profileOf = (row, stats) => ({
+          id: row.id,
+          username: row.username,
+          displayName: row.display_name || row.username,
+          role: String(row.role || "USER").toUpperCase(),
+          avatar: row.avatar || "",
+          bg: row.bg || "",
+          stats: stats || undefined,
+        });
+        const friendIds = async (id) => {
+          const r = await env.DB.prepare("SELECT a, b FROM friends WHERE a = ? OR b = ?").bind(id, id).all();
+          return (r.results || []).map((x) => (x.a === id ? x.b : x.a));
+        };
+        const usersByIds = async (ids) => {
+          const list = (ids || []).filter(Boolean);
+          if (!list.length) return [];
+          const marks = list.map(() => "?").join(",");
+          const r = await env.DB.prepare("SELECT * FROM users WHERE id IN (" + marks + ")").bind(...list).all();
+          return r.results || [];
+        };
+        const areFriends = async (a, b) => {
+          const pair = [a, b].sort();
+          const row = await env.DB.prepare("SELECT a FROM friends WHERE a = ? AND b = ?").bind(pair[0], pair[1]).first();
+          return !!row;
+        };
+        const addFriend = async (a, b) => {
+          const pair = [a, b].sort();
+          await env.DB.prepare("INSERT OR IGNORE INTO friends (a, b, created_at) VALUES (?, ?, ?)").bind(pair[0], pair[1], Date.now()).run();
+        };
+        const friendOr403 = async (otherId) => {
+          if (!otherId) return json({ error: { message: "Missing friend." } }, 400);
+          if (otherId !== userId && !(await areFriends(userId, otherId)))
+            return json({ error: { message: "Add this person as a friend first." } }, 403);
+          return null;
+        };
+
+        /* ---------- friends ---------- */
+        if (path === "/friends" && request.method === "GET") {
+          const ids = await friendIds(userId);
+          const rows = await usersByIds(ids);
+          const friends = [];
+          for (const row of rows) friends.push(profileOf(row, await statsFor(row.id)));
+          friends.sort((a, b) => String(a.displayName || a.username).localeCompare(String(b.displayName || b.username)));
+          const reqs = await env.DB.prepare(
+            "SELECT * FROM friend_requests WHERE to_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 50"
+          ).bind(userId).all();
+          const senders = await usersByIds((reqs.results || []).map((r) => r.from_id));
+          const byId = new Map(senders.map((u) => [u.id, u]));
+          const requests = (reqs.results || []).map((r) => ({
+            id: r.id,
+            createdAt: Number(r.created_at) || 0,
+            from: byId.get(r.from_id) ? profileOf(byId.get(r.from_id)) : { id: r.from_id, username: "unknown", displayName: "Unknown" },
+          }));
+          const um = await env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND read_at IS NULL").bind(userId).first();
+          const up = await env.DB.prepare("SELECT COUNT(*) AS n FROM pokes WHERE to_id = ? AND read_at IS NULL").bind(userId).first();
+          return json({
+            friends,
+            requests,
+            counts: {
+              friends: friends.length,
+              requests: requests.length,
+              unreadMessages: Number(um && um.n) || 0,
+              unreadPokes: Number(up && up.n) || 0,
+            },
+          });
+        }
+
+        if (path === "/friends/request" && request.method === "POST") {
+          let target = null;
+          if (body.friendId) target = await dbUser(cleanText(body.friendId, 40));
+          else {
+            const uname = cleanText(body.username, 24).toLowerCase().replace(/^@/, "");
+            if (uname) target = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(uname).first();
+          }
+          if (!target) return json({ error: { message: "No StudySpace account matches that username." } }, 404);
+          if (target.id === userId) return json({ error: { message: "That is your own username." } }, 400);
+          if (await areFriends(userId, target.id))
+            return json({ ok: true, already: true, friend: profileOf(target) });
+          const reverse = await env.DB.prepare(
+            "SELECT * FROM friend_requests WHERE from_id = ? AND to_id = ? AND status = 'pending'"
+          ).bind(target.id, userId).first();
+          if (reverse) {
+            await addFriend(userId, target.id);
+            await env.DB.prepare("UPDATE friend_requests SET status = 'accepted' WHERE id = ?").bind(reverse.id).run();
+            return json({ ok: true, accepted: true, friend: profileOf(target) });
+          }
+          const mine = await env.DB.prepare(
+            "SELECT id FROM friend_requests WHERE from_id = ? AND to_id = ? AND status = 'pending'"
+          ).bind(userId, target.id).first();
+          if (mine) return json({ ok: true, pending: true });
+          await env.DB.prepare(
+            "INSERT INTO friend_requests (id, from_id, to_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+          )
+            .bind(crypto.randomUUID(), userId, target.id, Date.now())
+            .run();
+          return json({ ok: true, pending: true, target: profileOf(target) });
+        }
+
+        if ((path === "/friends/accept" || path === "/friends/decline") && request.method === "POST") {
+          const id = cleanText(body.requestId, 40);
+          const row = id
+            ? await env.DB.prepare("SELECT * FROM friend_requests WHERE id = ? AND to_id = ?").bind(id, userId).first()
+            : null;
+          if (!row) return json({ error: { message: "That friend request is no longer available." } }, 404);
+          if (path === "/friends/accept") {
+            await addFriend(userId, row.from_id);
+            await env.DB.prepare("UPDATE friend_requests SET status = 'accepted' WHERE id = ?").bind(id).run();
+            const other = await dbUser(row.from_id);
+            return json({ ok: true, friend: other ? profileOf(other, await statsFor(other.id)) : null });
+          }
+          await env.DB.prepare("UPDATE friend_requests SET status = 'declined' WHERE id = ?").bind(id).run();
+          return json({ ok: true });
+        }
+
+        if (path === "/friends/search" && request.method === "GET") {
+          const q = cleanText(url.searchParams.get("q") || "", 24).toLowerCase().replace(/^@/, "");
+          if (q.length < 2) return json({ results: [] });
+          const rows = await env.DB.prepare(
+            "SELECT * FROM users WHERE username LIKE ? AND id <> ? ORDER BY username LIMIT 12"
+          ).bind("%" + q + "%", userId).all();
+          const ids = await friendIds(userId);
+          const sent = await env.DB.prepare("SELECT to_id FROM friend_requests WHERE from_id = ? AND status = 'pending'").bind(userId).all();
+          const sentIds = (sent.results || []).map((r) => r.to_id);
+          const incoming = await env.DB.prepare("SELECT from_id FROM friend_requests WHERE to_id = ? AND status = 'pending'").bind(userId).all();
+          const incomingIds = (incoming.results || []).map((r) => r.from_id);
+          const out = (rows.results || []).map((row) => ({
+            ...profileOf(row),
+            friend: ids.indexOf(row.id) >= 0,
+            pending: sentIds.indexOf(row.id) >= 0,
+            incoming: incomingIds.indexOf(row.id) >= 0,
+          }));
+          return json({ results: out });
+        }
+
+        if (path === "/friends/profile" && request.method === "GET") {
+          const id = cleanText(url.searchParams.get("id") || "", 40);
+          if (id !== userId && !(await areFriends(userId, id)))
+            return json({ error: { message: "Add this person as a friend first." } }, 403);
+          const row = await dbUser(id);
+          if (!row) return json({ error: { message: "That account no longer exists." } }, 404);
+          return json({ profile: { ...profileOf(row, await statsFor(row.id)), self: id === userId } });
+        }
+
+        if (path === "/profile/update" && request.method === "POST") {
+          const name = body.displayName === undefined ? null : cleanText(body.displayName, 40);
+          let avatar = body.avatar === undefined ? null : String(body.avatar || "");
+          let bg = body.bg === undefined ? null : String(body.bg || "").toLowerCase();
+          if (avatar !== null && avatar.length > 200000)
+            return json({ error: { message: "That picture is too large. Try a smaller image." } }, 413);
+          if (avatar && !/^(data:image\/(png|jpeg|jpg|webp|gif);base64,|av[1-8]$)/.test(avatar))
+            return json({ error: { message: "That picture format is not supported." } }, 400);
+          if (bg !== null && ["", "sage", "rose", "ocean", "sunset", "lavender", "midnight", "mint", "peach", "starlight"].indexOf(bg) < 0)
+            return json({ error: { message: "Pick one of the StudySpace themes." } }, 400);
+          const sets = [];
+          const vals = [];
+          if (name !== null) { sets.push("display_name = ?"); vals.push(name); }
+          if (avatar !== null) { sets.push("avatar = ?"); vals.push(avatar); }
+          if (bg !== null) { sets.push("bg = ?"); vals.push(bg); }
+          if (!sets.length) return json({ error: { message: "Nothing to update." } }, 400);
+          vals.push(userId);
+          await env.DB.prepare("UPDATE users SET " + sets.join(", ") + " WHERE id = ?").bind(...vals).run();
+          const row = await dbUser(userId);
+          return json({ ok: true, user: publicUser(row) });
+        }
+
+        /* ---------- chat ---------- */
+        if (path === "/chat/threads" && request.method === "GET") {
+          const ids = await friendIds(userId);
+          const rows = await usersByIds(ids);
+          const threads = [];
+          for (const row of rows) {
+            const last = await env.DB.prepare(
+              "SELECT * FROM messages WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?) ORDER BY created_at DESC LIMIT 1"
+            ).bind(userId, row.id, row.id, userId).first();
+            const un = await env.DB.prepare(
+              "SELECT COUNT(*) AS n FROM messages WHERE from_id = ? AND to_id = ? AND read_at IS NULL"
+            ).bind(row.id, userId).first();
+            threads.push({
+              friend: profileOf(row),
+              last: last ? { text: last.body, createdAt: Number(last.created_at) || 0, mine: last.from_id === userId } : null,
+              unread: Number(un && un.n) || 0,
+              at: last ? Number(last.created_at) || 0 : 0,
+            });
+          }
+          threads.sort((a, b) => b.at - a.at || String(a.friend.username).localeCompare(String(b.friend.username)));
+          return json({ threads });
+        }
+
+        if (path === "/chat/messages" && request.method === "GET") {
+          const friendId = cleanText(url.searchParams.get("friendId") || "", 40);
+          const blocked = await friendOr403(friendId);
+          if (blocked) return blocked;
+          const other = await dbUser(friendId);
+          if (!other) return json({ error: { message: "That account no longer exists." } }, 404);
+          const rows = await env.DB.prepare(
+            "SELECT * FROM messages WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?) ORDER BY created_at ASC LIMIT 200"
+          ).bind(userId, friendId, friendId, userId).all();
+          await env.DB.prepare("UPDATE messages SET read_at = ? WHERE from_id = ? AND to_id = ? AND read_at IS NULL")
+            .bind(Date.now(), friendId, userId)
+            .run();
+          return json({
+            friend: profileOf(other),
+            messages: (rows.results || []).map((m) => ({
+              id: m.id,
+              fromId: m.from_id,
+              toId: m.to_id,
+              text: m.body,
+              createdAt: Number(m.created_at) || 0,
+              mine: m.from_id === userId,
+            })),
+          });
+        }
+
+        if (path === "/chat/send" && request.method === "POST") {
+          const friendId = cleanText(body.friendId, 40);
+          const blocked = await friendOr403(friendId);
+          if (blocked) return blocked;
+          const text = String(body.text || "").trim().slice(0, 2000);
+          if (!text) return json({ error: { message: "Write a message first." } }, 400);
+          const id = crypto.randomUUID();
+          const now = Date.now();
+          await env.DB.prepare("INSERT INTO messages (id, from_id, to_id, body, created_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)")
+            .bind(id, userId, friendId, text, now)
+            .run();
+          return json({ ok: true, message: { id, fromId: userId, toId: friendId, text, createdAt: now, mine: true } });
+        }
+
+        if (path === "/chat/poke" && request.method === "POST") {
+          const friendId = cleanText(body.friendId, 40);
+          const blocked = await friendOr403(friendId);
+          if (blocked) return blocked;
+          const last = await env.DB.prepare(
+            "SELECT created_at FROM pokes WHERE from_id = ? AND to_id = ? ORDER BY created_at DESC LIMIT 1"
+          ).bind(userId, friendId).first();
+          if (last && Date.now() - (Number(last.created_at) || 0) < 8000)
+            return json({ error: { message: "Give it a few seconds before poking again." } }, 429);
+          await env.DB.prepare("INSERT INTO pokes (id, from_id, to_id, created_at, read_at) VALUES (?, ?, ?, ?, NULL)")
+            .bind(crypto.randomUUID(), userId, friendId, Date.now())
+            .run();
+          return json({ ok: true });
+        }
+
+        if (path === "/chat/pokes" && request.method === "GET") {
+          const rows = await env.DB.prepare(
+            "SELECT * FROM pokes WHERE to_id = ? ORDER BY created_at DESC LIMIT 50"
+          ).bind(userId).all();
+          const senders = await usersByIds((rows.results || []).map((p) => p.from_id));
+          const byId = new Map(senders.map((u) => [u.id, u]));
+          const items = (rows.results || []).map((p) => ({
+            id: p.id,
+            createdAt: Number(p.created_at) || 0,
+            unread: !p.read_at,
+            sender: byId.get(p.from_id) ? profileOf(byId.get(p.from_id)) : { id: p.from_id, username: "unknown", displayName: "Unknown" },
+          }));
+          await env.DB.prepare("UPDATE pokes SET read_at = ? WHERE to_id = ? AND read_at IS NULL").bind(Date.now(), userId).run();
+          return json({ pokes: items });
+        }
+
+        /* ---------- live room invitations ---------- */
+        if (path === "/room/invite" && request.method === "POST") {
+          const friendId = cleanText(body.friendId, 40);
+          const blocked = await friendOr403(friendId);
+          if (blocked) return blocked;
+          const code = String(body.roomCode || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+          if (code.length !== 6) return json({ error: { message: "Start a study room first." } }, 400);
+          const dup = await env.DB.prepare(
+            "SELECT id FROM room_invites WHERE from_id = ? AND to_id = ? AND room_code = ? AND status = 'pending' AND created_at > ?"
+          ).bind(userId, friendId, code, Date.now() - 120000).first();
+          if (dup) return json({ ok: true, already: true });
+          await env.DB.prepare(
+            "INSERT INTO room_invites (id, from_id, to_id, room_code, status, reason, created_at) VALUES (?, ?, ?, ?, 'pending', '', ?)"
+          )
+            .bind(crypto.randomUUID(), userId, friendId, code, Date.now())
+            .run();
+          return json({ ok: true });
+        }
+
+        if (path === "/room/invites" && request.method === "GET") {
+          const rows = await env.DB.prepare(
+            "SELECT * FROM room_invites WHERE to_id = ? AND status = 'pending' AND created_at > ? ORDER BY created_at DESC LIMIT 10"
+          ).bind(userId, Date.now() - 600000).all();
+          const senders = await usersByIds((rows.results || []).map((r) => r.from_id));
+          const byId = new Map(senders.map((u) => [u.id, u]));
+          return json({
+            invites: (rows.results || []).map((r) => ({
+              id: r.id,
+              roomCode: r.room_code,
+              createdAt: Number(r.created_at) || 0,
+              from: byId.get(r.from_id) ? profileOf(byId.get(r.from_id)) : { id: r.from_id, username: "unknown", displayName: "Unknown" },
+            })),
+          });
+        }
+
+        if (path === "/room/invites/respond" && request.method === "POST") {
+          const id = cleanText(body.inviteId, 40);
+          const row = id
+            ? await env.DB.prepare("SELECT * FROM room_invites WHERE id = ? AND to_id = ?").bind(id, userId).first()
+            : null;
+          if (!row) return json({ error: { message: "That invitation has expired." } }, 404);
+          const status = body.accept ? "accepted" : "declined";
+          const reason = cleanText(body.reason, 200);
+          await env.DB.prepare("UPDATE room_invites SET status = ?, reason = ?, responded_at = ? WHERE id = ?")
+            .bind(status, reason, Date.now(), id)
+            .run();
+          return json({ ok: true, status, roomCode: status === "accepted" ? row.room_code : "" });
+        }
+
+        if (path === "/room/invites/sent" && request.method === "GET") {
+          const code = String(url.searchParams.get("roomCode") || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+          const rows = await env.DB.prepare(
+            "SELECT * FROM room_invites WHERE from_id = ? AND created_at > ?" + (code ? " AND room_code = ?" : "") + " ORDER BY created_at DESC LIMIT 20"
+          )
+            .bind(...(code ? [userId, Date.now() - 600000, code] : [userId, Date.now() - 600000]))
+            .all();
+          const targets = await usersByIds((rows.results || []).map((r) => r.to_id));
+          const byId = new Map(targets.map((u) => [u.id, u]));
+          return json({
+            sent: (rows.results || []).map((r) => ({
+              id: r.id,
+              roomCode: r.room_code,
+              status: r.status,
+              reason: r.reason || "",
+              respondedAt: Number(r.responded_at) || 0,
+              to: byId.get(r.to_id) ? profileOf(byId.get(r.to_id)) : { id: r.to_id, username: "unknown", displayName: "Unknown" },
+            })),
+          });
+        }
+
+        /* ---------- customer service reports ---------- */
+        if (path === "/reports/submit" && request.method === "POST") {
+          const category = cleanText(body.category, 24);
+          const message = String(body.message || "").trim().slice(0, 4000);
+          if (["Bug", "Concern", "Feedback", "Suggestion"].indexOf(category) < 0)
+            return json({ error: { message: "Choose what your message is about." } }, 400);
+          if (message.length < 5) return json({ error: { message: "Tell us a little more (at least 5 characters)." } }, 400);
+          await env.DB.prepare(
+            "INSERT INTO reports (id, user_id, owner, category, message, status, created_at) VALUES (?, ?, 'urdevjaja', ?, ?, 'open', ?)"
+          )
+            .bind(crypto.randomUUID(), userId, category, message, Date.now())
+            .run();
+          return json({ ok: true });
+        }
+
+        if ((path === "/reports/list" || path === "/reports/update") && !isOwnerDev)
+          return json({ error: { message: "Not available." } }, 403);
+
+        if (path === "/reports/list" && request.method === "GET") {
+          const rows = await env.DB.prepare("SELECT * FROM reports ORDER BY created_at DESC LIMIT 200").all();
+          const senders = await usersByIds((rows.results || []).map((r) => r.user_id));
+          const byId = new Map(senders.map((u) => [u.id, u]));
+          return json({
+            reports: (rows.results || []).map((r) => ({
+              id: r.id,
+              category: r.category,
+              message: r.message,
+              status: r.status || "open",
+              createdAt: Number(r.created_at) || 0,
+              from: byId.get(r.user_id) ? profileOf(byId.get(r.user_id)) : { id: r.user_id, username: "deleted", displayName: "Deleted account" },
+            })),
+          });
+        }
+
+        if (path === "/reports/update" && request.method === "POST") {
+          const id = cleanText(body.id, 40);
+          const action = cleanText(body.action, 16);
+          if (!id) return json({ error: { message: "Missing report." } }, 400);
+          if (action === "delete") await env.DB.prepare("DELETE FROM reports WHERE id = ?").bind(id).run();
+          else await env.DB.prepare("UPDATE reports SET status = 'resolved' WHERE id = ?").bind(id).run();
+          return json({ ok: true });
+        }
+
+        return json({ error: { message: "Unknown social action." } }, 404);
+      } catch (err) {
+        return json({ error: { message: "The StudySpace service hit a problem. Please try again." } }, 500);
       }
     }
 
@@ -685,7 +1159,11 @@ export default {
 
     // ---- daily limits (per device, plus a looser per-IP cap) ----
     const ip = request.headers.get("CF-Connecting-IP") || "anon";
+    /* A signed-in developer account has no daily AI limits. The session token is
+       checked here, so a plain request without one still counts normally. */
+    let devQuota = false;
     async function checkQuota(kind, device) {
+      if (devQuota) return { ok: true };
       if (!env.QUOTA) return { ok: true };
       const day = new Date(Date.now() + TZ_OFFSET_H * 3600e3).toISOString().slice(0, 10);
       const devKey = `q:${kind}:${day}:d:${device || "none"}`;
@@ -706,6 +1184,14 @@ export default {
     try {
       const body = await request.json().catch(() => null);
       if (!body || typeof body !== "object") return json({ error: { message: "Bad request." } }, 400);
+
+      try {
+        const aiUser = env.DB ? await tokenUser(request) : null;
+        if (aiUser) {
+          const row = await env.DB.prepare("SELECT role FROM users WHERE id = ?").bind(aiUser).first();
+          if (row && String(row.role || "").toUpperCase() === "DEV") devQuota = true;
+        }
+      } catch (e) {}
 
       const device = /^[a-z0-9]{8,40}$/i.test(body.device || "") ? body.device : "";
       const mode = body.mode === "acct" ? "accounting" : ["chat", "life", "accounting", "assign"].includes(body.mode) ? body.mode : "cards";
