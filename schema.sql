@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS messages (
   from_id TEXT NOT NULL,
   to_id TEXT NOT NULL,
   body TEXT NOT NULL,
+  attachment TEXT DEFAULT '',
+  attachment_name TEXT DEFAULT '',
+  attachment_type TEXT DEFAULT '',
   created_at INTEGER,
   read_at INTEGER
 );

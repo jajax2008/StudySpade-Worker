@@ -256,7 +256,7 @@ export default {
           const tables = [
             "CREATE TABLE IF NOT EXISTS friends (a TEXT NOT NULL, b TEXT NOT NULL, created_at INTEGER, PRIMARY KEY (a, b))",
             "CREATE TABLE IF NOT EXISTS friend_requests (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at INTEGER)",
-            "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER, read_at INTEGER)",
+            "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, body TEXT NOT NULL, attachment TEXT DEFAULT '', attachment_name TEXT DEFAULT '', attachment_type TEXT DEFAULT '', created_at INTEGER, read_at INTEGER)",
             "CREATE TABLE IF NOT EXISTS pokes (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, created_at INTEGER, read_at INTEGER)",
             "CREATE TABLE IF NOT EXISTS room_invites (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, room_code TEXT NOT NULL, status TEXT DEFAULT 'pending', reason TEXT DEFAULT '', created_at INTEGER, responded_at INTEGER)",
             "CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, owner TEXT NOT NULL, category TEXT NOT NULL, message TEXT NOT NULL, status TEXT DEFAULT 'open', created_at INTEGER)",
@@ -267,6 +267,14 @@ export default {
             "CREATE INDEX IF NOT EXISTS idx_requests_to ON friend_requests (to_id, status)",
           ];
           for (const ddl of tables) {
+            try { await env.DB.prepare(ddl).run(); } catch (e) {}
+          }
+          /* Chat attachments arrived after the first messages table. */
+          for (const ddl of [
+            "ALTER TABLE messages ADD COLUMN attachment TEXT DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN attachment_name TEXT DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN attachment_type TEXT DEFAULT ''",
+          ]) {
             try { await env.DB.prepare(ddl).run(); } catch (e) {}
           }
           await seedDevAccounts();
@@ -635,12 +643,20 @@ export default {
         if (path === "/profile/update" && request.method === "POST") {
           const name = body.displayName === undefined ? null : cleanText(body.displayName, 40);
           let avatar = body.avatar === undefined ? null : String(body.avatar || "");
-          let bg = body.bg === undefined ? null : String(body.bg || "").toLowerCase();
+          let bg = body.bg === undefined ? null : String(body.bg || "");
+          /* Theme keys are lowercase, but a base64 photo background must keep
+             its exact characters. */
+          if (bg !== null && bg.slice(0, 11) !== "data:image/") bg = bg.toLowerCase();
           if (avatar !== null && avatar.length > 200000)
             return json({ error: { message: "That picture is too large. Try a smaller image." } }, 413);
           if (avatar && !/^(data:image\/(png|jpeg|jpg|webp|gif);base64,|av[1-8]$)/.test(avatar))
             return json({ error: { message: "That picture format is not supported." } }, 400);
-          if (bg !== null && ["", "sage", "rose", "ocean", "sunset", "lavender", "midnight", "mint", "peach", "starlight"].indexOf(bg) < 0)
+          if (bg !== null && bg.slice(0, 11) === "data:image/") {
+            if (!/^data:image\/(png|jpeg|jpg|webp);base64,/.test(bg))
+              return json({ error: { message: "That background format is not supported." } }, 400);
+            if (bg.length > 400000)
+              return json({ error: { message: "That background is too large. Try a smaller photo." } }, 413);
+          } else if (bg !== null && ["", "sage", "rose", "ocean", "sunset", "lavender", "midnight", "mint", "peach", "starlight"].indexOf(bg) < 0)
             return json({ error: { message: "Pick one of the StudySpace themes." } }, 400);
           const sets = [];
           const vals = [];
@@ -668,7 +684,7 @@ export default {
             ).bind(row.id, userId).first();
             threads.push({
               friend: profileOf(row),
-              last: last ? { text: last.body, createdAt: Number(last.created_at) || 0, mine: last.from_id === userId } : null,
+              last: last ? { text: last.body, attachmentName: last.attachment_name || "", createdAt: Number(last.created_at) || 0, mine: last.from_id === userId } : null,
               unread: Number(un && un.n) || 0,
               at: last ? Number(last.created_at) || 0 : 0,
             });
@@ -696,6 +712,9 @@ export default {
               fromId: m.from_id,
               toId: m.to_id,
               text: m.body,
+              attachment: m.attachment || "",
+              attachmentName: m.attachment_name || "",
+              attachmentType: m.attachment_type || "",
               createdAt: Number(m.created_at) || 0,
               mine: m.from_id === userId,
             })),
@@ -707,13 +726,37 @@ export default {
           const blocked = await friendOr403(friendId);
           if (blocked) return blocked;
           const text = String(body.text || "").trim().slice(0, 2000);
-          if (!text) return json({ error: { message: "Write a message first." } }, 400);
+          let attachment = String(body.attachment || "");
+          const attachmentName = cleanText(body.attachmentName, 80);
+          let attachmentType = String(body.attachmentType || "").toLowerCase();
+          if (attachment) {
+            const isImage = /^data:image\/(png|jpeg|jpg|webp);base64,/.test(attachment);
+            const isPdf = /^data:application\/pdf;base64,/.test(attachment);
+            if (!isImage && !isPdf)
+              return json({ error: { message: "Attach a photo or a PDF." } }, 400);
+            if (attachment.length > 950000)
+              return json({ error: { message: "That file is too large. Try a smaller one." } }, 413);
+            attachmentType = isImage ? "image" : "file";
+          } else {
+            attachment = "";
+            attachmentType = "";
+          }
+          if (!text && !attachment) return json({ error: { message: "Write a message first." } }, 400);
           const id = crypto.randomUUID();
           const now = Date.now();
-          await env.DB.prepare("INSERT INTO messages (id, from_id, to_id, body, created_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)")
-            .bind(id, userId, friendId, text, now)
+          await env.DB.prepare(
+            "INSERT INTO messages (id, from_id, to_id, body, attachment, attachment_name, attachment_type, created_at, read_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+          )
+            .bind(id, userId, friendId, text, attachment, attachment ? attachmentName : "", attachmentType, now)
             .run();
-          return json({ ok: true, message: { id, fromId: userId, toId: friendId, text, createdAt: now, mine: true } });
+          return json({
+            ok: true,
+            message: {
+              id, fromId: userId, toId: friendId, text,
+              attachment, attachmentName: attachment ? attachmentName : "", attachmentType,
+              createdAt: now, mine: true,
+            },
+          });
         }
 
         if (path === "/chat/poke" && request.method === "POST") {
