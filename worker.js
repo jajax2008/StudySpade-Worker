@@ -1631,6 +1631,32 @@ export default {
         return finish(out, q);
       }
 
+      // Mode: Study Games — multiple-choice questions from uploaded study material
+      if (body.mode === "game") {
+        const missingGame = needGemini(gemini2, "quiz (GEMINI_API_KEY2)");
+        if (missingGame) return missingGame;
+        const gameText = (body.text || "").toString().trim();
+        if (gameText.length < 40) return json({ error: { message: "Text is too short to make questions." } }, 400);
+        const gq = await checkQuota("cardgen", device);
+        if (!gq.ok) return limitReply();
+        const gcount = Math.max(6, Math.min(20, parseInt(body.count, 10) || 12));
+        const gout = await askGemini(
+          [{
+            role: "user",
+            parts: [{
+              text: `Create exactly ${gcount} multiple-choice quiz questions from the study material below. Spread them across the whole material, easiest first, and make every wrong choice plausible. Use short answers (max 6 words). Also give a one-sentence explanation. Return ONLY valid JSON: {"questions":[{"q":"question","a":"exact correct answer","choices":["correct answer","wrong 1","wrong 2","wrong 3"],"e":"one short explanation","lvl":0}]} where lvl is 0 (easy), 1 (medium) or 2 (hard).\n\nStudy Material:\n${gameText.slice(0, 20000)}`
+            }]
+          }],
+          { responseMimeType: "application/json", maxOutputTokens: Math.min(16000, gcount * 260 + 900) },
+          undefined,
+          { deadlineMs: 70000, hedgeMs: 24000 }
+        );
+        if (gout.status === 200) {
+          if (gq.commit) await gq.commit();
+        }
+        return json(gout.data, gout.status);
+      }
+
       // Mode: AI Summarizer + Flashcard Maker (Gemini key 2)
       const missingCards = needGemini(gemini2, "summarizer/flashcards (GEMINI_API_KEY2)");
       if (missingCards) return missingCards;
